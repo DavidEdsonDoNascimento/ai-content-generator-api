@@ -2,7 +2,7 @@ import type { Content } from '../../generated/prisma/client.js';
 import { ContentStatus } from '../../generated/prisma/enums.js';
 import type { DbClient } from '../../infra/db/prisma.js';
 import { CONTENT_FAILURE_CODES } from './content.failure.js';
-import { CANCELABLE_STATUSES } from './content.state.js';
+import { CANCELABLE_STATUSES, CLAIMABLE_STATUSES } from './content.state.js';
 
 /**
  * Acesso ao conteúdo.
@@ -100,10 +100,13 @@ export async function failForQueueUnavailable(db: DbClient, id: string): Promise
  *
  * O incremento de `attempts` vive **dentro** do mesmo `UPDATE` de propósito: uma
  * escrita separada poderia contar uma tentativa que nunca começou.
+ *
+ * O predicado usa `CLAIMABLE_STATUSES`, e não `CANCELABLE_STATUSES`: os dois
+ * conjuntos têm o mesmo conteúdo hoje, mas respondem a perguntas diferentes.
  */
 export async function claimForProcessing(db: DbClient, id: string): Promise<boolean> {
   const { count } = await db.content.updateMany({
-    where: { id, status: { in: [...CANCELABLE_STATUSES] } },
+    where: { id, status: { in: [...CLAIMABLE_STATUSES] } },
     data: { status: ContentStatus.PROCESSING, attempts: { increment: 1 } },
   });
 

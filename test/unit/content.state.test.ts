@@ -6,6 +6,7 @@ import {
   cancelRejectionFor,
   canCancel,
   canTransition,
+  CLAIMABLE_STATUSES,
   isTerminal,
   TERMINAL_STATUSES,
 } from '../../src/modules/contents/content.state.js';
@@ -37,6 +38,15 @@ describe('conjuntos de estados', () => {
 
     expect([...cancelable].filter((status) => terminal.has(status))).toEqual([]);
     expect(new Set([...cancelable, ...terminal])).toEqual(new Set(ALL_STATUSES));
+  });
+
+  it('o claim do Worker parte de PENDING ou PROCESSING, e de nenhum terminal', () => {
+    // Fixado literalmente, e não derivado de `CANCELABLE_STATUSES`: derivar de
+    // outro conjunto é exatamente o acoplamento que esta constante existe para
+    // desfazer. Se um estado terminal entrar aqui, o Worker passa a poder
+    // ressuscitar conteúdo concluído ou cancelado — e este teste cai primeiro.
+    expect([...CLAIMABLE_STATUSES]).toEqual([ContentStatus.PENDING, ContentStatus.PROCESSING]);
+    expect([...CLAIMABLE_STATUSES].filter(isTerminal)).toEqual([]);
   });
 });
 

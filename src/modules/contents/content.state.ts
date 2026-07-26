@@ -34,6 +34,22 @@ export const CANCELABLE_STATUSES = [ContentStatus.PENDING, ContentStatus.PROCESS
 
 export type CancelableStatus = (typeof CANCELABLE_STATUSES)[number];
 
+/**
+ * Estados a partir dos quais o Worker pode assumir o conteúdo: `PENDING` na
+ * primeira execução e `PROCESSING` no retry — entre as tentativas o conteúdo
+ * permanece em `PROCESSING`, porque voltar para `PENDING` seria transição
+ * proibida (ADR-005).
+ *
+ * Hoje o conjunto **coincide** com `CANCELABLE_STATUSES`, e é justamente por
+ * isso que ele existe separado: "de onde se pode cancelar" e "de onde o Worker
+ * pode assumir" são duas políticas independentes que por ora dão no mesmo. Com
+ * uma constante só, acrescentar um estado cancelável-mas-não-assumível mudaria
+ * o predicado do claim em silêncio, sem ninguém tocar no Worker.
+ */
+export const CLAIMABLE_STATUSES = [ContentStatus.PENDING, ContentStatus.PROCESSING] as const;
+
+export type ClaimableStatus = (typeof CLAIMABLE_STATUSES)[number];
+
 /** Transições permitidas, na forma origem → destinos possíveis (0002 §7). */
 const ALLOWED_TRANSITIONS: Readonly<Record<ContentStatus, readonly ContentStatus[]>> = {
   [ContentStatus.PENDING]: [ContentStatus.PROCESSING, ContentStatus.CANCELED],
