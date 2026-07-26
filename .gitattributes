@@ -1,4 +1,52 @@
+# Finais de linha.
+#
+# O repositório é LF. Sem regra explícita isso depende do `core.autocrlf` de
+# cada máquina, e a Fase 6 mostrou o custo real: três arquivos editados no
+# Windows voltaram em CRLF, o `git diff` passou a mostrar arquivos inteiros
+# reescritos para mudanças de dez linhas, e o `format:check` quebrou por um
+# motivo que não tinha nada a ver com o código. Declarar aqui tira a decisão da
+# configuração local da máquina e a coloca no repositório, que é onde ela
+# pertence.
+#
+# As regras são por extensão, e não um `* text=auto` genérico: a detecção
+# automática acerta quase sempre, e "quase sempre" aplicado a um binário
+# significa corrompê-lo em silêncio no checkout.
+
+*.ts     text eol=lf
+*.tsx    text eol=lf
+*.js     text eol=lf
+*.mjs    text eol=lf
+*.cjs    text eol=lf
+*.json   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.prisma text eol=lf
+*.sql    text eol=lf
+*.toml   text eol=lf
+*.md     text eol=lf
+
 # Scripts executados dentro de containers Linux precisam de LF.
 # Sem isso, um checkout no Windows com core.autocrlf=true quebra o shebang
 # (`#!/bin/sh\r`) e o script falha silenciosamente dentro do container.
-*.sh text eol=lf
+*.sh     text eol=lf
+
+# Arquivos sem extensão e dotfiles que também entram em container ou em
+# ferramenta sensível a `\r`.
+Dockerfile      text eol=lf
+.dockerignore   text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+.prettierignore text eol=lf
+.env.example    text eol=lf
+
+# Binários: declarados explicitamente para que nenhuma regra futura de
+# normalização os alcance. Não há nenhum versionado hoje — a lista existe para
+# que o primeiro a entrar já esteja protegido.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.woff  binary
+*.woff2 binary
