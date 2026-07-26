@@ -1,0 +1,105 @@
+## Fase 2 — infraestrutura local. Sobe API, PostgreSQL, Redis e Minio (com o
+## bucket já criado) com um único `docker compose up`.
+##
+## O serviço `worker` ainda não existe: BullMQ e o Worker são implementados na
+## Fase 5. Adicioná-lo agora só para preencher o compose faria `docker compose
+## up` falhar por falta de um `dist/worker.js` real — ver docs/0006_ChangeLog.md.
+##
+## A API não depende de postgres/redis/minio nesta fase: o código ainda não os
+## consome (nem Prisma, nem BullMQ, nem o SDK do S3 existem em src/). Fazer a
+## API esperar por integrações que ela não usa simularia uma dependência que
+## não existe de verdade.
+
+services:
+  postgres:
+    image: postgres:16.14-alpine3.24
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ai_content}
+      POSTGRES_USER: ${POSTGRES_USER:-ai_content}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env (copie de .env.example)}
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  redis:
+    image: redis:7.4.9-alpine3.21
+    restart: unless-stopped
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: server --console-address ":9001" /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?defina MINIO_ROOT_USER no .env (copie de .env.example)}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?defina MINIO_ROOT_PASSWORD no .env (copie de .env.example)}
+    ports:
+      - '${MINIO_API_PORT:-9000}:9000'
+      - '${MINIO_CONSOLE_PORT:-9001}:9001'
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # One-shot: cria o bucket e aplica a policy de leitura pública. Ver
+  # docker/minio-init.sh e o estágio `minio-init` do Dockerfile.
+  minio-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?defina MINIO_ROOT_USER no .env (copie de .env.example)}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?defina MINIO_ROOT_PASSWORD no .env (copie de .env.example)}
+      MINIO_BUCKET: ${MINIO_BUCKET:-ai-content}
+    restart: 'no'
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    restart: unless-stopped
+    environment:
+      # Fixas: são o contrato interno do container, não a configuração do host.
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - '${API_PORT:-3000}:3000'
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://127.0.0.1:3000/health']
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

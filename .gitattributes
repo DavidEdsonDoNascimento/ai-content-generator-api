@@ -1,0 +1,4 @@
+# Scripts executados dentro de containers Linux precisam de LF.
+# Sem isso, um checkout no Windows com core.autocrlf=true quebra o shebang
+# (`#!/bin/sh\r`) e o script falha silenciosamente dentro do container.
+*.sh text eol=lf

@@ -1,0 +1,30 @@
+# O Dockerfile só faz COPY de caminhos explícitos (package.json, tsconfig.json,
+# src/), nunca `COPY . .` — isso já evita que segredo ou lixo entre na imagem.
+# Este arquivo é defesa em profundidade e reduz o contexto enviado ao daemon.
+
+node_modules
+dist
+*.tsbuildinfo
+
+.git
+.gitignore
+.gitattributes
+
+.env
+.env.*
+!.env.example
+
+# Documentação e planejamento não pertencem à imagem de execução.
+docs
+ref
+AGENTS.md
+CLAUDE.md
+*.md
+
+.claude
+.vscode
+.idea
+
+npm-debug.log*
+coverage
+.eslintcache
