@@ -29,6 +29,25 @@ const envSchema = z.object({
     .refine((value) => value.startsWith('postgresql://') || value.startsWith('postgres://'), {
       message: 'deve ser uma URL PostgreSQL (postgresql:// ou postgres://)',
     }),
+
+  // Conexão com o Redis. Obrigatória a partir da Fase 5: a API publica o job e o
+  // Worker o consome — sem ela, `POST /generate` não teria como cumprir o
+  // contrato. Pode conter senha, então a mensagem também é estática.
+  REDIS_URL: z
+    .string()
+    .min(1)
+    .refine((value) => value.startsWith('redis://') || value.startsWith('rediss://'), {
+      message: 'deve ser uma URL Redis (redis:// ou rediss://)',
+    }),
+
+  // Simulação da IA. Os padrões são os do enunciado — 5 s de espera e 20 % de
+  // falha; os testes reduzem o delay e forçam a taxa para 0 ou 1, o que remove a
+  // aleatoriedade sem alterar o comportamento de produção.
+  AI_DELAY_MS: z.coerce.number().int().nonnegative().default(5000),
+  AI_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0.2),
+
+  // Tentativas por job no BullMQ, contando a primeira (ADR-005).
+  JOB_ATTEMPTS: z.coerce.number().int().min(1).default(3),
 });
 
 export type Env = z.infer<typeof envSchema>;

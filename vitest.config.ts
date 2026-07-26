@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { defineConfig } from 'vitest/config';
 
 import { resolveTestDatabaseUrl } from './test/setup/test-database.js';
+import { resolveTestRedisUrl } from './test/setup/test-redis.js';
 
 /**
  * Dois projetos com naturezas diferentes (0005 §2):
@@ -28,7 +29,18 @@ if (existsSync(envFilePath)) {
  */
 const UNIT_DATABASE_URL = 'postgresql://unit:unit@127.0.0.1:1/unit_tests_never_connect';
 
-const SHARED_ENV = { NODE_ENV: 'test', LOG_LEVEL: 'silent' } as const;
+/** Mesmo raciocínio para o Redis: as filas dos unitários são duplos em memória. */
+const UNIT_REDIS_URL = 'redis://127.0.0.1:1/0';
+
+const SHARED_ENV = {
+  NODE_ENV: 'test',
+  LOG_LEVEL: 'silent',
+  // A IA de produção espera 5 s; nos testes o delay é escolhido caso a caso, e
+  // este padrão só garante que nenhum teste esbarre nele por descuido.
+  AI_DELAY_MS: '0',
+  AI_FAILURE_RATE: '0',
+  JOB_ATTEMPTS: '3',
+} as const;
 
 export default defineConfig({
   test: {
@@ -38,7 +50,7 @@ export default defineConfig({
           name: 'unit',
           include: ['test/unit/**/*.test.ts'],
           environment: 'node',
-          env: { ...SHARED_ENV, DATABASE_URL: UNIT_DATABASE_URL },
+          env: { ...SHARED_ENV, DATABASE_URL: UNIT_DATABASE_URL, REDIS_URL: UNIT_REDIS_URL },
         },
       },
       {
@@ -46,7 +58,11 @@ export default defineConfig({
           name: 'integration',
           include: ['test/integration/**/*.test.ts'],
           environment: 'node',
-          env: { ...SHARED_ENV, DATABASE_URL: resolveTestDatabaseUrl() },
+          env: {
+            ...SHARED_ENV,
+            DATABASE_URL: resolveTestDatabaseUrl(),
+            REDIS_URL: resolveTestRedisUrl(),
+          },
           globalSetup: ['test/setup/global-setup.ts'],
           setupFiles: ['test/setup/reset-database.ts'],
           // Um banco, um `TRUNCATE` por teste: arquivos em paralelo limpariam a

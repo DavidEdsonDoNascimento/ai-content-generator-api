@@ -10,8 +10,41 @@
  *
  * Execução: `npm run prisma:seed` (ou `npx prisma db seed`). No Docker, roda
  * apenas quando `RUN_SEED=true` — ver docker/migrate-entrypoint.sh e ADR-023.
+ *
+ * **Client próprio, e não o singleton da aplicação.** O seed roda no container
+ * one-shot `migrate`, que fala só com o PostgreSQL. Importar
+ * `src/infra/db/prisma.ts` arrastaria `src/config/env.ts` inteiro — e desde a
+ * Fase 5 ele exige `REDIS_URL`, variável que este container legitimamente não
+ * usa. Declará-la aqui só para o schema passar é exatamente o hábito que a
+ * ADR-018 proíbe; o desacoplamento resolve de forma permanente, e vale também
+ * para as variáveis de S3 que a Fase 6 vai acrescentar. O client e o adapter
+ * continuam sendo os mesmos da aplicação — o que deixa de ser exercitado aqui é a
+ * validação de ambiente da API, que nunca foi o ponto (ADR-028).
  */
-import { disconnectPrisma, prisma } from '../src/infra/db/prisma.js';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+import { PrismaPg } from '@prisma/adapter-pg';
+
+import { PrismaClient } from '../src/generated/prisma/client.js';
+
+const envFilePath = resolve(process.cwd(), '.env');
+if (existsSync(envFilePath)) {
+  process.loadEnvFile(envFilePath);
+}
+
+const connectionString = process.env['DATABASE_URL'];
+
+if (connectionString === undefined || connectionString === '') {
+  // Mensagem sem o valor: a URL carrega senha.
+  process.stderr.write('[seed] DATABASE_URL ausente — nada a semear.\n');
+  process.exit(1);
+}
+
+const prisma = new PrismaClient({
+  adapter: new PrismaPg({ connectionString }),
+  log: ['warn', 'error'],
+});
 
 /** UUIDs fixos e documentados: o avaliador usa estes valores direto no `curl`. */
 const SEED_USERS = [
@@ -52,5 +85,5 @@ try {
   process.stderr.write(`[seed] falhou: ${reason}\n`);
   process.exitCode = 1;
 } finally {
-  await disconnectPrisma();
+  await prisma.$disconnect();
 }
