@@ -3,6 +3,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { AppInstance } from '../../src/app.js';
 import { ContentStatus } from '../../src/generated/prisma/enums.js';
 import { prisma } from '../../src/infra/db/prisma.js';
+import { CONTENT_FAILURE_CODES } from '../../src/modules/contents/content.failure.js';
+import * as contentRepository from '../../src/modules/contents/content.repository.js';
+import * as userRepository from '../../src/modules/users/user.repository.js';
 import { buildTestApp, postGenerate } from '../helpers/app.js';
 import { countContents, createUser, creditsOf } from '../helpers/factories.js';
 
@@ -125,6 +128,80 @@ describe('C-01 — corrida de crédito', () => {
     expect(rejected).toHaveLength(3);
     expect(await creditsOf(user.id)).toBe(0);
     expect(await countContents(user.id)).toBe(2);
+  });
+});
+
+describe('compensação de QUEUE_UNAVAILABLE sob concorrência', () => {
+  /**
+   * A compensação da mesma linha, executada em paralelo.
+   *
+   * O unitário do service já prova que o estorno **segue** o retorno de
+   * `failForQueueUnavailable` — mas ele simula a guarda com uma flag em
+   * memória. A guarda de verdade é o `WHERE status = 'PENDING' AND
+   * "creditRefundedAt" IS NULL` avaliado pelo PostgreSQL sob lock de linha, e é
+   * isso que este caso exercita: duas transações concorrentes disputando a
+   * mesma linha, com o banco real decidindo quem vence.
+   *
+   * Sem essa guarda no banco, as duas transações leriam `creditRefundedAt`
+   * nulo, as duas compensariam e o usuário terminaria com **dois** créditos de
+   * volta por uma cobrança só — dinheiro criado do nada, e o tipo de defeito
+   * que nenhum teste sequencial encontra.
+   */
+  async function compensate(contentId: string, userId: string): Promise<boolean> {
+    return prisma.$transaction(async (tx) => {
+      const compensated = await contentRepository.failForQueueUnavailable(tx, contentId);
+
+      if (compensated) {
+        await userRepository.refundCredit(tx, userId);
+      }
+
+      return compensated;
+    });
+  }
+
+  it('duas compensações concorrentes devolvem no máximo um crédito', async () => {
+    for (let round = 0; round < 5; round += 1) {
+      const user = await createUser(1);
+
+      // Estado exato deixado por um `POST /generate` cujo `queue.add` falhou:
+      // crédito já debitado, conteúdo em PENDING, nada estornado ainda.
+      const response = await postGenerate(app, { topic: TOPIC, userId: user.id });
+      expect(response.statusCode).toBe(201);
+      const contentId = response.json<{ id: string }>().id;
+      expect(await creditsOf(user.id), `saldo debitado na rodada ${String(round)}`).toBe(0);
+
+      const results = await Promise.all([
+        compensate(contentId, user.id),
+        compensate(contentId, user.id),
+      ]);
+
+      // Exatamente uma das duas afetou a linha; a outra encontrou
+      // `creditRefundedAt` já preenchido e não afetou nada.
+      expect(results.filter(Boolean), `vencedores na rodada ${String(round)}`).toHaveLength(1);
+      expect(await creditsOf(user.id), `saldo estornado na rodada ${String(round)}`).toBe(1);
+
+      const content = await prisma.content.findUniqueOrThrow({ where: { id: contentId } });
+      expect(content.status).toBe(ContentStatus.FAILED);
+      expect(content.errorMessage).toBe(CONTENT_FAILURE_CODES.QUEUE_UNAVAILABLE);
+      expect(content.creditRefundedAt).not.toBeNull();
+    }
+  });
+
+  it('compensar um conteúdo que já saiu de PENDING não estorna', async () => {
+    const user = await createUser(1);
+    const response = await postGenerate(app, { topic: TOPIC, userId: user.id });
+    const contentId = response.json<{ id: string }>().id;
+
+    // O Worker pegou o conteúdo antes de a compensação rodar — o job foi
+    // publicado e só a resposta se perdeu. Atropelar o processamento em curso
+    // seria pior que o 503.
+    await contentRepository.claimForProcessing(prisma, contentId);
+
+    expect(await compensate(contentId, user.id)).toBe(false);
+    expect(await creditsOf(user.id)).toBe(0);
+    expect((await prisma.content.findUniqueOrThrow({ where: { id: contentId } })).status).toBe(
+      ContentStatus.PROCESSING,
+    );
   });
 });
 

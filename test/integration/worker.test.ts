@@ -450,3 +450,117 @@ describe('job tardio de conteúdo compensado', () => {
     expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
   });
 });
+
+/**
+ * C-04 — entrega *at-least-once*.
+ *
+ * A fila promete entregar **pelo menos** uma vez, não exatamente uma. As duas
+ * defesas contra isso são de naturezas diferentes e por isso têm um caso cada:
+ *
+ * - **enquanto o job existe**, o `jobId = contentId` faz o BullMQ recusar o
+ *   segundo `add` — dedupe de graça (ADR-007);
+ * - **depois que o job some** (o `removeOnComplete: { count: 100 }` libera o id
+ *   para reuso), o dedupe já não protege nada, e quem responde é a guarda de
+ *   estado terminal no início do processor.
+ *
+ * A segunda é a que importa: a primeira é otimização, a segunda é a garantia.
+ * Os testes de idempotência acima chamam o processor **direto**; estes passam
+ * pela fila real, que é onde a duplicata de verdade nasce.
+ */
+describe('C-04 — processamento duplicado', () => {
+  it('mesmo jobId publicado duas vezes → uma execução, um upload, uma tentativa', async () => {
+    const contentId = await generateContent();
+    let generateCalls = 0;
+
+    // Segundo `add` com o job da requisição original ainda na fila.
+    await context.queue.enqueue(contentId);
+    expect(await context.raw.getWaitingCount()).toBe(1);
+
+    worker = startWorker({
+      context,
+      queueName: QUEUE_NAME,
+      storage,
+      generate: async (topic) => {
+        generateCalls += 1;
+        return `texto sobre ${topic}`;
+      },
+    });
+
+    await waitForStatus(contentId, ContentStatus.COMPLETED);
+
+    const content = await reload(contentId);
+    expect(generateCalls).toBe(1);
+    expect(content.attempts).toBe(1);
+    expect(storage.uploadCount()).toBe(1);
+    expect(storage.objects.size).toBe(1);
+  });
+
+  it('reenfileirar depois de o job sumir: conteúdo COMPLETED torna a segunda entrega inerte', async () => {
+    const contentId = await generateContent();
+
+    worker = startWorker({
+      context,
+      queueName: QUEUE_NAME,
+      storage,
+      generate: async (topic) => `texto sobre ${topic}`,
+    });
+    await waitForStatus(contentId, ContentStatus.COMPLETED);
+    await worker.close();
+    worker = undefined;
+
+    const completed = await reload(contentId);
+    const creditsBefore = await prisma.user.findUniqueOrThrow({
+      where: { id: completed.userId },
+      select: { credits: true },
+    });
+    const uploadsBefore = storage.uploadCount();
+
+    // Fecha a janela de dedupe à mão, em vez de publicar 100 jobs para que o
+    // `removeOnComplete` a feche sozinho. O efeito no Redis é o mesmo: a chave
+    // do job deixa de existir e o `contentId` volta a ser aceito.
+    await (await context.raw.getJob(contentId))?.remove();
+    await context.queue.enqueue(contentId);
+
+    // O segundo `add` foi aceito — é essa aceitação que prova que o dedupe por
+    // `jobId` tem janela finita, e que a guarda de estado é quem protege daqui
+    // em diante (ADR-007).
+    expect(await context.raw.getWaitingCount()).toBe(1);
+
+    worker = startWorker({
+      context,
+      queueName: QUEUE_NAME,
+      storage,
+      generate: async () => {
+        throw new Error('a IA não deveria rodar para um conteúdo já concluído');
+      },
+    });
+
+    await waitFor(
+      async () => {
+        const job = await context.raw.getJob(contentId);
+        return job !== undefined && (await job.isCompleted());
+      },
+      { description: 'a segunda entrega terminar' },
+    );
+
+    const after = await reload(contentId);
+    // O job encerra em **sucesso** e nada se move: nem status, nem tentativa,
+    // nem timestamp, nem crédito, nem storage.
+    expect(after.status).toBe(ContentStatus.COMPLETED);
+    expect(after.attempts).toBe(completed.attempts);
+    expect(after.completedAt?.getTime()).toBe(completed.completedAt?.getTime());
+    expect(after.updatedAt.getTime()).toBe(completed.updatedAt.getTime());
+    expect(after.fileKey).toBe(completed.fileKey);
+    expect(storage.uploadCount()).toBe(uploadsBefore);
+    expect(storage.removed).toEqual([]);
+    expect(storage.objects.size).toBe(1);
+    expect(
+      (
+        await prisma.user.findUniqueOrThrow({
+          where: { id: completed.userId },
+          select: { credits: true },
+        })
+      ).credits,
+    ).toBe(creditsBefore.credits);
+  });
+});
