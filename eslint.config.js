@@ -21,6 +21,7 @@ export default tseslint.config(
       'prisma.config.ts',
       'vitest.config.ts',
       'vitest.e2e.config.ts',
+      'scripts/**/*.ts',
     ],
     languageOptions: {
       parserOptions: {
