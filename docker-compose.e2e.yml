@@ -1,0 +1,28 @@
+## Override usado **apenas** pelo E2E opt-in (`npm run test:e2e`).
+##
+## Por que ele existe: a IA simulada falha em 20 % das vezes por padrão, que é o
+## comportamento do enunciado e precisa continuar sendo o padrão. Com `attempts:
+## 3`, um conteúdo termina em FAILED em 0,2³ = 0,8 % das execuções — raro o
+## bastante para passar despercebido e frequente o bastante para tornar o E2E
+## intermitente. Um teste que falha 1 vez em 125 é pior que teste nenhum: ensina
+## a ignorar vermelho.
+##
+## O override zera a taxa e encurta a espera **só para o processo do Worker**,
+## sem tocar em `.env`, `.env.example` ou no `docker-compose.yml`. Nada aqui é
+## uma segunda arquitetura de deployment: é o mesmo serviço, com duas variáveis
+## trocadas.
+##
+## Aplicado e revertido automaticamente pelos scripts `pretest:e2e` e
+## `posttest:e2e`. Para reverter à mão, se um E2E falhar no meio:
+##
+##   docker compose up -d --force-recreate worker
+
+services:
+  worker:
+    environment:
+      # Determinismo: o E2E prova o fluxo completo, não a estatística do retry.
+      # Retry e falha definitiva já têm cobertura própria na suíte de integração.
+      AI_FAILURE_RATE: '0'
+      # 5 s por conteúdo é o padrão do enunciado e não acrescenta informação a um
+      # teste que só espera o estado terminal.
+      AI_DELAY_MS: '500'

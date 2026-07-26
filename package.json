@@ -29,6 +29,9 @@
     "test:unit": "vitest run --project unit",
     "test:integration": "vitest run --project integration",
     "test:watch": "vitest",
+    "pretest:e2e": "docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d --force-recreate worker",
+    "test:e2e": "vitest run -c vitest.e2e.config.ts",
+    "posttest:e2e": "docker compose up -d --force-recreate worker",
     "validate": "npm run prisma:generate && npm run prisma:validate && npm run typecheck && npm run lint && npm run format:check && npm run test:unit && npm run build"
   },
   "overrides": {

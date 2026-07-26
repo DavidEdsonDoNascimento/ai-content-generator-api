@@ -20,6 +20,7 @@ export default tseslint.config(
       'test/**/*.ts',
       'prisma.config.ts',
       'vitest.config.ts',
+      'vitest.e2e.config.ts',
     ],
     languageOptions: {
       parserOptions: {

@@ -34,6 +34,7 @@
     "prisma/**/*.ts",
     "test/**/*.ts",
     "prisma.config.ts",
-    "vitest.config.ts"
+    "vitest.config.ts",
+    "vitest.e2e.config.ts"
   ]
 }
