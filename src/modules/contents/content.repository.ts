@@ -1,7 +1,7 @@
 import type { Content } from '../../generated/prisma/client.js';
 import { ContentStatus } from '../../generated/prisma/enums.js';
 import type { DbClient } from '../../infra/db/prisma.js';
-import { ERROR_CODES } from '../../shared/errors/domain-errors.js';
+import { CONTENT_FAILURE_CODES } from './content.failure.js';
 import { CANCELABLE_STATUSES } from './content.state.js';
 
 /**
@@ -81,7 +81,7 @@ export async function failForQueueUnavailable(db: DbClient, id: string): Promise
     data: {
       status: ContentStatus.FAILED,
       // Código sanitizado, nunca a mensagem do Redis (ADR-010).
-      errorMessage: ERROR_CODES.QUEUE_UNAVAILABLE,
+      errorMessage: CONTENT_FAILURE_CODES.QUEUE_UNAVAILABLE,
       creditRefundedAt: new Date(),
     },
   });
@@ -113,18 +113,26 @@ export async function claimForProcessing(db: DbClient, id: string): Promise<bool
 /**
  * Finalização com sucesso. **Esta é a garantia** contra o Worker ressuscitar um
  * conteúdo cancelado (ADR-006): o `WHERE status = PROCESSING` é avaliado
- * atomicamente, então um `CANCELED` gravado durante os 5 s da IA faz este
- * `UPDATE` não encontrar linha nenhuma.
+ * atomicamente, então um `CANCELED` gravado durante os 5 s da IA ou durante o
+ * upload faz este `UPDATE` não encontrar linha nenhuma.
  *
- * Na Fase 5 não há `fileUrl`/`fileKey` — o upload é da Fase 6. O conteúdo chega
- * a `COMPLETED` sem arquivo, que é um checkpoint transitório, não o estado final
- * pretendido pelo enunciado.
+ * `status`, `fileKey`, `fileUrl` e `completedAt` são gravados **na mesma
+ * instrução**, de propósito. Marcar `COMPLETED` primeiro e preencher a URL
+ * depois abriria uma janela em que o cliente veria um conteúdo concluído sem
+ * arquivo — e uma consulta nesse instante devolveria `fileUrl: null` para algo
+ * que o contrato promete preenchido.
  */
-export async function completeIfProcessing(db: DbClient, id: string): Promise<boolean> {
+export async function completeIfProcessing(
+  db: DbClient,
+  id: string,
+  file: { fileKey: string; fileUrl: string },
+): Promise<boolean> {
   const { count } = await db.content.updateMany({
     where: { id, status: ContentStatus.PROCESSING },
     data: {
       status: ContentStatus.COMPLETED,
+      fileKey: file.fileKey,
+      fileUrl: file.fileUrl,
       completedAt: new Date(),
       // Limpa o motivo de uma falha anterior que acabou sendo superada no retry.
       errorMessage: null,

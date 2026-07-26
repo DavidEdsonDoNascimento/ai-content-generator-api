@@ -1,4 +1,5 @@
 import { buildApp, type AppInstance } from './app.js';
+import { loadApiEnv } from './config/api-env.js';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
 import { disconnectPrisma, prisma } from './infra/db/prisma.js';
@@ -17,8 +18,13 @@ const SHUTDOWN_TIMEOUT_MS = 10_000;
  * torna o encerramento previsível: quem abriu, fecha, na ordem inversa.
  */
 function composeQueue(): { queue: ContentQueue; close: () => Promise<void> } {
-  const connection = createPublisherConnection(env.REDIS_URL);
-  const queue = createContentQueue({ connection, attempts: env.JOB_ATTEMPTS });
+  // Ambiente específico da API, validado aqui e não no import de um módulo: a
+  // API publica jobs, então precisa do Redis — e **não** declara nada de S3,
+  // porque não faz upload (ADR-030).
+  const apiEnv = loadApiEnv();
+
+  const connection = createPublisherConnection(apiEnv.REDIS_URL);
+  const queue = createContentQueue({ connection, attempts: apiEnv.JOB_ATTEMPTS });
 
   return {
     queue,

@@ -1,5 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 
+import { CONTENT_FAILURE_CODES } from '../../modules/contents/content.failure.js';
+
 /**
  * Simulação da IA, exatamente como o enunciado descreve: espera 5 segundos e
  * falha intencionalmente em 20 % das vezes.
@@ -15,7 +17,7 @@ import { setTimeout as delay } from 'node:timers/promises';
  */
 
 /** Código sanitizado gravado em `Content.errorMessage` (ADR-010). */
-export const AI_GENERATION_FAILED = 'AI_GENERATION_FAILED';
+export const AI_GENERATION_FAILED = CONTENT_FAILURE_CODES.AI_GENERATION_FAILED;
 
 /**
  * Falha da IA. Existe como classe própria para o processor distinguir "a IA

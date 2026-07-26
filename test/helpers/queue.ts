@@ -10,6 +10,7 @@ import {
 import { createContentQueue, type ContentQueue } from '../../src/infra/queue/content-queue.js';
 import type { ContentJobData } from '../../src/infra/queue/job.types.js';
 import * as contentRepository from '../../src/modules/contents/content.repository.js';
+import type { StorageService } from '../../src/infra/storage/storage.types.js';
 import type { GenerateWithAi } from '../../src/worker/ai/generate-content.js';
 import { createContentProcessor } from '../../src/worker/content.processor.js';
 import { createContentWorker } from '../../src/worker/content.worker.js';
@@ -87,6 +88,7 @@ export interface StartWorkerOptions {
   readonly context: QueueContext;
   readonly queueName: string;
   readonly generate: GenerateWithAi;
+  readonly storage: StorageService;
   readonly concurrency?: number;
 }
 
@@ -99,6 +101,7 @@ export function startWorker(options: StartWorkerOptions): Worker<ContentJobData>
     db: prisma,
     contents: contentRepository,
     generate: options.generate,
+    storage: options.storage,
     logger: silentLogger,
   });
 
@@ -117,11 +120,13 @@ export function startWorker(options: StartWorkerOptions): Worker<ContentJobData>
 /** O processor real, para exercitar idempotência sem passar pela fila. */
 export function buildProcessor(
   generate: GenerateWithAi,
+  storage: StorageService,
 ): (job: Job<ContentJobData>) => Promise<void> {
   return createContentProcessor({
     db: prisma,
     contents: contentRepository,
     generate,
+    storage,
     logger: silentLogger,
   });
 }

@@ -4,16 +4,41 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 
 /**
+ * Ambiente **base**: o que todo processo do repositório precisa, e nada além.
+ *
+ * A partir da Fase 6 a configuração é dividida por processo. O motivo é
+ * concreto, não estético: um schema único cresce com a união de tudo que
+ * *algum* processo usa, e como os módulos se alcançam por cadeia de imports,
+ * processos que não usam uma integração passam a ser obrigados a declará-la. Foi
+ * exatamente o que quebrou o `docker compose up` na Fase 5 — o container de
+ * migrations parou de subir por causa de uma `REDIS_URL` que ele nunca leria
+ * (ADR-029) — e as credenciais de S3 repetiriam o problema com juros.
+ *
+ * A divisão fica assim:
+ *
+ * | Processo | Valida |
+ * |---|---|
+ * | base (Prisma, logger) | `NODE_ENV`, `HOST`, `PORT`, `LOG_LEVEL`, `DATABASE_URL` |
+ * | API (`api-env.ts`) | base + `REDIS_URL` + `JOB_ATTEMPTS` |
+ * | Worker (`worker-env.ts`) | base + `REDIS_URL` + IA + S3 |
+ * | seed / migrator | só `DATABASE_URL`, lido direto |
+ *
+ * Nenhum schema tem valor padrão para endereço ou credencial: uma configuração
+ * ausente **falha no boot** em vez de cair silenciosamente em `localhost`.
+ */
+
+/**
  * Em desenvolvimento as variáveis vêm de um `.env` local; em container elas
  * chegam pelo ambiente e o arquivo não existe. `process.loadEnvFile` (Node >= 20.12)
- * cobre o primeiro caso sem dependência externa.
+ * cobre o primeiro caso sem dependência externa — e **não** sobrescreve variável
+ * já definida, o que deixa o ambiente real sempre com a última palavra.
  */
 const envFilePath = resolve(process.cwd(), '.env');
 if (existsSync(envFilePath)) {
   process.loadEnvFile(envFilePath);
 }
 
-const envSchema = z.object({
+const baseEnvSchema = z.object({
   // Sem valor padrão de propósito: o ambiente de execução é uma escolha
   // explícita, não algo a ser adivinhado no boot.
   NODE_ENV: z.enum(['development', 'test', 'production']),
@@ -29,28 +54,21 @@ const envSchema = z.object({
     .refine((value) => value.startsWith('postgresql://') || value.startsWith('postgres://'), {
       message: 'deve ser uma URL PostgreSQL (postgresql:// ou postgres://)',
     }),
-
-  // Conexão com o Redis. Obrigatória a partir da Fase 5: a API publica o job e o
-  // Worker o consome — sem ela, `POST /generate` não teria como cumprir o
-  // contrato. Pode conter senha, então a mensagem também é estática.
-  REDIS_URL: z
-    .string()
-    .min(1)
-    .refine((value) => value.startsWith('redis://') || value.startsWith('rediss://'), {
-      message: 'deve ser uma URL Redis (redis:// ou rediss://)',
-    }),
-
-  // Simulação da IA. Os padrões são os do enunciado — 5 s de espera e 20 % de
-  // falha; os testes reduzem o delay e forçam a taxa para 0 ou 1, o que remove a
-  // aleatoriedade sem alterar o comportamento de produção.
-  AI_DELAY_MS: z.coerce.number().int().nonnegative().default(5000),
-  AI_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0.2),
-
-  // Tentativas por job no BullMQ, contando a primeira (ADR-005).
-  JOB_ATTEMPTS: z.coerce.number().int().min(1).default(3),
 });
 
-export type Env = z.infer<typeof envSchema>;
+export type Env = z.infer<typeof baseEnvSchema>;
+
+/**
+ * Conexão com o Redis. Compartilhada por API (publica o job) e Worker (consome),
+ * e por isso definida aqui em vez de duplicada nos dois schemas. Pode conter
+ * senha, então a mensagem também é estática.
+ */
+export const redisUrlSchema = z
+  .string()
+  .min(1)
+  .refine((value) => value.startsWith('redis://') || value.startsWith('rediss://'), {
+    message: 'deve ser uma URL Redis (redis:// ou rediss://)',
+  });
 
 export class EnvValidationError extends Error {
   constructor(issues: readonly string[]) {
@@ -67,12 +85,15 @@ export class EnvValidationError extends Error {
 }
 
 /**
- * Valida o ambiente. As mensagens citam apenas o **nome** da variável e o motivo
- * da rejeição — nunca o valor recebido —, para que um segredo malformado não
- * acabe em log ou em saída de terminal.
+ * Valida um schema contra o ambiente. As mensagens citam apenas o **nome** da
+ * variável e o motivo da rejeição — nunca o valor recebido —, para que um
+ * segredo malformado não acabe em log ou em saída de terminal.
  */
-export function parseEnv(source: NodeJS.ProcessEnv): Env {
-  const result = envSchema.safeParse(source);
+export function parseEnvWith<T extends z.ZodType>(
+  schema: T,
+  source: NodeJS.ProcessEnv,
+): z.infer<T> {
+  const result = schema.safeParse(source);
 
   if (!result.success) {
     const issues = result.error.issues.map((issue) => {
@@ -86,12 +107,21 @@ export function parseEnv(source: NodeJS.ProcessEnv): Env {
   return result.data;
 }
 
-function loadEnv(): Env {
+/** Compatibilidade com o schema base. */
+export function parseEnv(source: NodeJS.ProcessEnv): Env {
+  return parseEnvWith(baseEnvSchema, source);
+}
+
+/**
+ * Carrega e valida, encerrando o processo com mensagem legível se algo faltar.
+ * Falhar rápido no boot é preferível a descobrir a configuração errada na
+ * primeira requisição.
+ */
+export function loadEnvOrExit<T extends z.ZodType>(schema: T): z.infer<T> {
   try {
-    return parseEnv(process.env);
+    return parseEnvWith(schema, process.env);
   } catch (error) {
     if (error instanceof EnvValidationError) {
-      // Falha rápida e legível: o processo não deve subir com ambiente inválido.
       process.stderr.write(`${error.message}\n`);
       process.exit(1);
     }
@@ -99,4 +129,10 @@ function loadEnv(): Env {
   }
 }
 
-export const env: Env = loadEnv();
+/**
+ * Ambiente base, carregado no import porque `prisma.ts` e `logger.ts` precisam
+ * dele em qualquer processo. Os schemas por processo são carregados **sob
+ * demanda**, pelo composition root — assim importar um módulo num teste
+ * unitário não obriga a declarar credenciais de S3.
+ */
+export const env: Env = loadEnvOrExit(baseEnvSchema);

@@ -1,5 +1,5 @@
 import type { Worker } from 'bullmq';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import type { AppInstance } from '../../src/app.js';
 import type { Content } from '../../src/generated/prisma/client.js';
@@ -7,9 +7,10 @@ import { ContentStatus } from '../../src/generated/prisma/enums.js';
 import { prisma } from '../../src/infra/db/prisma.js';
 import type { ContentJobData } from '../../src/infra/queue/job.types.js';
 import { AI_GENERATION_FAILED, AiGenerationError } from '../../src/worker/ai/generate-content.js';
-import { buildTestApp, postCancel, postGenerate } from '../helpers/app.js';
+import { buildTestApp, getContent, postCancel, postGenerate } from '../helpers/app.js';
 import { deferred, waitFor } from '../helpers/async.js';
 import { createContent, createUser } from '../helpers/factories.js';
+import { createFakeStorage, type FakeStorage } from '../helpers/fake-storage.js';
 import {
   buildProcessor,
   createQueueContext,
@@ -41,6 +42,12 @@ const TOPIC = 'Ciclo assíncrono completo';
 let app: AppInstance;
 let context: QueueContext;
 let worker: Worker<ContentJobData> | undefined;
+/** Storage em memória, novo a cada caso — ver `test/helpers/fake-storage.ts`. */
+let storage: FakeStorage;
+
+beforeEach(() => {
+  storage = createFakeStorage();
+});
 
 beforeAll(async () => {
   context = createQueueContext({ queueName: QUEUE_NAME, backoffDelayMs: 10 });
@@ -88,6 +95,7 @@ describe('I-01 estendido — caminho feliz assíncrono', () => {
     worker = startWorker({
       context,
       queueName: QUEUE_NAME,
+      storage,
       generate: async (topic) => `texto sobre ${topic}`,
     });
 
@@ -97,10 +105,43 @@ describe('I-01 estendido — caminho feliz assíncrono', () => {
     expect(content.attempts).toBe(1);
     expect(content.completedAt).not.toBeNull();
     expect(content.errorMessage).toBeNull();
-    // Checkpoint transitório da Fase 5: o upload é da Fase 6, então COMPLETED
-    // ainda não tem arquivo. Não é o estado final pretendido pelo enunciado.
-    expect(content.fileUrl).toBeNull();
-    expect(content.fileKey).toBeNull();
+
+    // A Fase 6 fecha o checkpoint transitório da Fase 5: `COMPLETED` agora
+    // carrega o arquivo, e os dois campos foram gravados na mesma instrução do
+    // status — nunca houve um instante de `COMPLETED` sem URL.
+    const key = `contents/${contentId}.txt`;
+    expect(content.fileKey).toBe(key);
+    expect(content.fileUrl).toBe(`http://localhost:9000/ai-content/${key}`);
+
+    // Um único objeto, com o texto da IA em UTF-8.
+    expect(storage.uploadCount()).toBe(1);
+    expect(storage.objects.size).toBe(1);
+    expect(storage.text(key)).toContain(TOPIC);
+    expect(storage.removed).toEqual([]);
+  });
+
+  it('GET /api/content/:id devolve a URL pública e nenhum campo interno', async () => {
+    const contentId = await generateContent();
+
+    worker = startWorker({
+      context,
+      queueName: QUEUE_NAME,
+      storage,
+      generate: async (topic) => `texto sobre ${topic}`,
+    });
+
+    await waitForStatus(contentId, ContentStatus.COMPLETED);
+
+    const response = await getContent(app, contentId);
+    const body = response.json<Record<string, unknown>>();
+
+    expect(response.statusCode).toBe(200);
+    expect(body['fileUrl']).toBe(`http://localhost:9000/ai-content/contents/${contentId}.txt`);
+    // O endereço interno da rede do Compose nunca chega ao cliente (ADR-009).
+    expect(String(body['fileUrl'])).not.toContain('minio:9000');
+    // `fileKey` é interno e continua fora do contrato.
+    expect(body).not.toHaveProperty('fileKey');
+    expect(body).not.toHaveProperty('creditRefundedAt');
   });
 
   it('a resposta HTTP não espera a IA', async () => {
@@ -110,6 +151,7 @@ describe('I-01 estendido — caminho feliz assíncrono', () => {
     worker = startWorker({
       context,
       queueName: QUEUE_NAME,
+      storage,
       generate: async () => {
         await release.promise;
         return 'texto';
@@ -140,6 +182,7 @@ describe('I-08 — retry: falha na primeira, sucesso na segunda', () => {
     worker = startWorker({
       context,
       queueName: QUEUE_NAME,
+      storage,
       generate: async (topic) => {
         calls += 1;
         statusPerAttempt.push((await reload(contentId)).status);
@@ -172,6 +215,7 @@ describe('I-09 — falha definitiva', () => {
     worker = startWorker({
       context,
       queueName: QUEUE_NAME,
+      storage,
       generate: async () => {
         statusPerAttempt.push((await reload(contentId)).status);
         throw new AiGenerationError();
@@ -201,6 +245,7 @@ describe('I-09 — falha definitiva', () => {
     worker = startWorker({
       context,
       queueName: QUEUE_NAME,
+      storage,
       generate: async () => {
         throw new Error('ECONNREFUSED 10.0.0.7:443 token=segredo-interno');
       },
@@ -224,6 +269,7 @@ describe('I-06 — cancelamento durante PROCESSING', () => {
     worker = startWorker({
       context,
       queueName: QUEUE_NAME,
+      storage,
       generate: async () => {
         aiStarted.resolve();
         // A IA fica travada exatamente onde os 5 s de produção estariam: é essa
@@ -257,6 +303,11 @@ describe('I-06 — cancelamento durante PROCESSING', () => {
     expect(content.completedAt).toBeNull();
     expect(content.canceledAt).not.toBeNull();
     expect(content.fileUrl).toBeNull();
+    expect(content.fileKey).toBeNull();
+
+    // O cancelamento chegou **antes** do upload, então a guarda pré-upload
+    // economizou os bytes: nada foi gravado, e não há órfão a remover.
+    expect(storage.history).toEqual([]);
   });
 
   it('cancelar durante a última tentativa impede até o FAILED', async () => {
@@ -267,6 +318,7 @@ describe('I-06 — cancelamento durante PROCESSING', () => {
     worker = startWorker({
       context,
       queueName: QUEUE_NAME,
+      storage,
       generate: async () => {
         aiStarted.resolve();
         await release.promise;
@@ -304,7 +356,7 @@ describe('I-10 — idempotência do processor', () => {
       const content = await createContent({ userId: user.id, status });
       const before = await reload(content.id);
 
-      const process = buildProcessor(async () => 'não deveria ser chamada');
+      const process = buildProcessor(async () => 'não deveria ser chamada', storage);
       await process(fakeJob(content.id));
 
       const after = await reload(content.id);
@@ -323,14 +375,19 @@ describe('I-10 — idempotência do processor', () => {
       select: { credits: true, id: true },
     });
 
-    worker = startWorker({ context, queueName: QUEUE_NAME, generate: async () => 'texto' });
+    worker = startWorker({
+      context,
+      queueName: QUEUE_NAME,
+      storage,
+      generate: async () => 'texto',
+    });
     await waitForStatus(contentId, ContentStatus.COMPLETED);
     await worker.close();
     worker = undefined;
 
     const completed = await reload(contentId);
 
-    const process = buildProcessor(async () => 'segunda passada');
+    const process = buildProcessor(async () => 'segunda passada', storage);
     await process(fakeJob(contentId, 0));
 
     const after = await reload(contentId);
@@ -347,7 +404,7 @@ describe('I-10 — idempotência do processor', () => {
   });
 
   it('conteúdo inexistente → erro não retentável, sem criar nada', async () => {
-    const process = buildProcessor(async () => 'texto');
+    const process = buildProcessor(async () => 'texto', storage);
 
     await expect(process(fakeJob('11111111-1111-4111-8111-111111111111'))).rejects.toThrow(
       /não existe/,
@@ -371,6 +428,7 @@ describe('job tardio de conteúdo compensado', () => {
     worker = startWorker({
       context,
       queueName: QUEUE_NAME,
+      storage,
       generate: async () => 'texto que não deveria ser gerado',
     });
     await context.queue.enqueue(content.id);
