@@ -25,8 +25,14 @@
     "prisma:seed": "prisma db seed",
     "validate": "npm run prisma:generate && npm run prisma:validate && npm run typecheck && npm run lint && npm run format:check && npm run build"
   },
+  "overrides": {
+    "@fastify/swagger-ui": {
+      "@fastify/static": "10.1.2"
+    }
+  },
   "dependencies": {
     "@fastify/swagger": "9.8.1",
+    "@fastify/swagger-ui": "6.1.0",
     "@prisma/adapter-pg": "7.9.0",
     "@prisma/client": "7.9.0",
     "fastify": "5.10.0",

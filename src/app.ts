@@ -14,7 +14,9 @@ import {
 } from 'fastify-type-provider-zod';
 
 import { loggerOptions } from './config/logger.js';
+import { contentRoutes } from './modules/contents/content.routes.js';
 import { healthRoutes } from './modules/health/health.routes.js';
+import { registerSwagger } from './plugins/swagger.js';
 import { registerErrorHandler } from './shared/http/error-handler.js';
 
 /** Instância do Fastify com os schemas Zod como fonte de tipos das rotas. */
@@ -43,7 +45,12 @@ export async function buildApp(): Promise<AppInstance> {
 
   registerErrorHandler(app);
 
-  await app.register(healthRoutes);
+  // Antes das rotas: o `@fastify/swagger` coleta os schemas no hook `onRoute`, e
+  // rota registrada antes dele ficaria fora do documento OpenAPI.
+  await registerSwagger(app);
+
+  await app.register(healthRoutes());
+  await app.register(contentRoutes());
 
   return app;
 }
