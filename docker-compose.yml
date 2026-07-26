@@ -1,14 +1,18 @@
 ## Infraestrutura local. Sobe PostgreSQL, Redis, Minio (com o bucket já criado),
-## aplica as migrations e sobe a API — tudo com um único `docker compose up`.
+## aplica as migrations e sobe API e Worker — tudo com um único
+## `docker compose up`.
 ##
-## O serviço `worker` ainda não existe: BullMQ e o Worker são implementados na
-## Fase 5. Adicioná-lo agora só para preencher o compose faria `docker compose
-## up` falhar por falta de um `dist/worker.js` real — ver ADR-019.
+## API e Worker usam a **mesma imagem**, com `command` diferente (ADR-012): mesma
+## base de código e mesmas dependências, então duas imagens seriam duplicação.
 ##
-## Ordem de inicialização: postgres saudável → `migrate` conclui com sucesso →
-## `api` sobe. A API só depende do que ela de fato usa: PostgreSQL (a partir da
-## Fase 3) e o schema já migrado. Redis e Minio ainda não são consumidos por
-## nenhuma linha de `src/`, então não entram no `depends_on` da API.
+## Ordem de inicialização: postgres e redis saudáveis → `migrate` conclui com
+## sucesso → `api` e `worker` sobem. Cada serviço declara só o que de fato usa.
+## Minio ainda não é consumido por nenhuma linha de `src/` e por isso não entra em
+## nenhum `depends_on` — ele passa a ser dependência do Worker na Fase 6.
+##
+## Migrations continuam sendo responsabilidade exclusiva do serviço one-shot
+## `migrate` (ADR-022). O Worker **não** as aplica: dois processos correndo
+## `migrate deploy` ao mesmo tempo disputariam a mesma migration.
 
 services:
   postgres:
@@ -108,6 +112,14 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      # Ordem de boot e resiliência em runtime são coisas diferentes: esperar o
+      # Redis aqui evita que a primeira requisição de `docker compose up` falhe
+      # sem motivo, mas a API **não** morre se o Redis cair depois — nesse caso
+      # `POST /generate` responde 503 com o crédito estornado, e consultas e
+      # cancelamentos seguem funcionando (por isso Redis também não entra em
+      # `/ready`).
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     environment:
       # Fixas: são o contrato interno do container, não a configuração do host.
@@ -116,6 +128,8 @@ services:
       PORT: 3000
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DATABASE_URL: postgresql://${POSTGRES_USER:-ai_content}:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env (copie de .env.example)}@postgres:5432/${POSTGRES_DB:-ai_content}
+      REDIS_URL: redis://redis:6379
+      JOB_ATTEMPTS: ${JOB_ATTEMPTS:-3}
     ports:
       - '${API_PORT:-3000}:3000'
     healthcheck:
@@ -124,6 +138,38 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+  # Consome a fila BullMQ. Mesma imagem da API, `command` diferente (ADR-012).
+  #
+  # Sem healthcheck: o Worker não serve HTTP, e inventar uma porta só para
+  # satisfazer o Compose adicionaria superfície para nada. O sinal de saúde dele é
+  # continuar de pé — o processo vive enquanto consome a fila e encerra com exit 0
+  # no SIGTERM, o que é verificável por `docker compose ps` e pelos logs.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    command: ['node', 'dist/worker.js']
+    depends_on:
+      # O schema precisa existir antes de o primeiro job ser processado.
+      migrate:
+        condition: service_completed_successfully
+      # Diferente da API, o Worker **começa** falando com o Redis: sem fila, ele
+      # não tem o que fazer.
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai_content}:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env (copie de .env.example)}@postgres:5432/${POSTGRES_DB:-ai_content}
+      REDIS_URL: redis://redis:6379
+      # Padrões do enunciado: 5 s de espera e 20 % de falha. Sobrescrever no .env
+      # permite demonstrar o retry de forma determinística.
+      AI_DELAY_MS: ${AI_DELAY_MS:-5000}
+      AI_FAILURE_RATE: ${AI_FAILURE_RATE:-0.2}
+      JOB_ATTEMPTS: ${JOB_ATTEMPTS:-3}
 
 volumes:
   pgdata:
