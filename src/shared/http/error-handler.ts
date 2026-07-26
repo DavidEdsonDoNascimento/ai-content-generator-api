@@ -5,6 +5,8 @@ import {
 } from 'fastify-type-provider-zod';
 import { z } from 'zod';
 
+import { isAppError } from '../errors/app-error.js';
+
 /**
  * Formato único de erro da API. Todas as respostas de erro — de validação a 500 —
  * saem com esta forma, e o mesmo schema alimentará o OpenAPI na Fase 4.
@@ -31,8 +33,9 @@ function buildErrorResponse(code: string, message: string, requestId: string): E
  * ou detalhe de infraestrutura no corpo de um 500. O erro completo vai só para o
  * log estruturado, correlacionado pelo `requestId` devolvido ao cliente.
  *
- * O catálogo de erros de domínio (`AppError`) entra na Fase 4; aqui ficam apenas
- * os três caminhos que já existem: validação, serialização e erro inesperado.
+ * A ordem dos caminhos abaixo importa: do mais específico (erro que nós mesmos
+ * criamos, com resposta já decidida) para o mais genérico (erro desconhecido,
+ * que vira 500 sem detalhe).
  */
 export function registerErrorHandler(app: FastifyInstance): void {
   app.setNotFoundHandler((request: FastifyRequest, reply: FastifyReply) => {
@@ -42,6 +45,17 @@ export function registerErrorHandler(app: FastifyInstance): void {
   });
 
   app.setErrorHandler((error: FastifyError, request: FastifyRequest, reply: FastifyReply) => {
+    // Erro de domínio: `code` e `message` foram escritos por nós para serem
+    // lidos pelo cliente. `warn`, não `error` — é fluxo previsto (saldo
+    // insuficiente, conteúdo já cancelado), não defeito do servidor.
+    if (isAppError(error)) {
+      request.log.warn({ code: error.code, statusCode: error.statusCode }, 'domain error');
+      void reply
+        .status(error.statusCode)
+        .send(buildErrorResponse(error.code, error.message, request.id));
+      return;
+    }
+
     // Body/params/query fora do schema Zod da rota.
     if (hasZodFastifySchemaValidationErrors(error)) {
       request.log.warn({ err: error }, 'request validation failed');
