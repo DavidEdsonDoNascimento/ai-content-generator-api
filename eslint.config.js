@@ -14,7 +14,13 @@ export default tseslint.config(
     // Todo TypeScript do repositório entra no lint com tipagem — os três globs
     // correspondem ao `include` do tsconfig.json, então o `projectService`
     // sempre encontra um projeto para o arquivo.
-    files: ['src/**/*.ts', 'prisma/**/*.ts', 'prisma.config.ts'],
+    files: [
+      'src/**/*.ts',
+      'prisma/**/*.ts',
+      'test/**/*.ts',
+      'prisma.config.ts',
+      'vitest.config.ts',
+    ],
     languageOptions: {
       parserOptions: {
         projectService: true,

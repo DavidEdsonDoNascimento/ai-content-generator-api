@@ -23,7 +23,11 @@
     "prisma:migrate:deploy": "prisma migrate deploy",
     "prisma:migrate:status": "prisma migrate status",
     "prisma:seed": "prisma db seed",
-    "validate": "npm run prisma:generate && npm run prisma:validate && npm run typecheck && npm run lint && npm run format:check && npm run build"
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:watch": "vitest",
+    "validate": "npm run prisma:generate && npm run prisma:validate && npm run typecheck && npm run lint && npm run format:check && npm run test:unit && npm run build"
   },
   "overrides": {
     "@fastify/swagger-ui": {
@@ -51,6 +55,7 @@
     "prisma": "7.9.0",
     "tsx": "4.23.1",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.65.0"
+    "typescript-eslint": "8.65.0",
+    "vitest": "4.1.10"
   }
 }

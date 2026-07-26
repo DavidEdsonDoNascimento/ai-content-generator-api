@@ -11,3 +11,7 @@ prisma/migrations
 *.md
 docs
 ref
+
+# Configuração local da ferramenta: não é versionada e é reescrita por ela
+# mesma, então formatá-la só faria `validate` falhar por motivo alheio ao código.
+.claude

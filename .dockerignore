@@ -28,3 +28,7 @@ CLAUDE.md
 npm-debug.log*
 coverage
 .eslintcache
+
+# Suíte de testes: roda no host, nunca dentro da imagem de execução.
+test
+vitest.config.ts
