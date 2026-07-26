@@ -39,6 +39,29 @@ export async function debitCredit(db: DbClient, userId: string): Promise<boolean
  * `false`, para separar `404 USER_NOT_FOUND` de `402 INSUFFICIENT_CREDITS`
  * (ADR-002). Fora do caminho quente, por construção.
  */
+/**
+ * Devolve **exatamente um** crédito. Usada só na compensação de
+ * `QUEUE_UNAVAILABLE` (ADR-003/ADR-008), nunca em cancelamento nem em falha da
+ * IA — nesses casos o crédito pagou um processamento que de fato foi tentado.
+ *
+ * A idempotência **não** está aqui: quem a garante é o `UPDATE` condicional em
+ * `failForQueueUnavailable`, que só afeta linha quando `creditRefundedAt` ainda
+ * é nulo. Esta função só é chamada quando aquele update afetou uma linha, e as
+ * duas rodam na mesma transação — então o estorno acontece no máximo uma vez.
+ *
+ * `updateMany` e não `update` para não lançar caso o usuário tenha sumido: o
+ * estorno é compensação, e falhar aqui transformaria um `503` informativo num
+ * `500` opaco.
+ */
+export async function refundCredit(db: DbClient, userId: string): Promise<boolean> {
+  const { count } = await db.user.updateMany({
+    where: { id: userId },
+    data: { credits: { increment: 1 } },
+  });
+
+  return count === 1;
+}
+
 export async function exists(db: DbClient, userId: string): Promise<boolean> {
   const user = await db.user.findUnique({
     where: { id: userId },

@@ -8,7 +8,7 @@ import {
   generateContentBodySchema,
   generateContentResponseSchema,
 } from './content.schemas.js';
-import { contentService, type ContentService } from './content.service.js';
+import type { ContentService } from './content.service.js';
 
 /**
  * Rotas de conteúdo.
@@ -22,7 +22,7 @@ import { contentService, type ContentService } from './content.service.js';
  * O `schema` de cada rota é o mesmo objeto que gera o OpenAPI — a documentação
  * não pode divergir do que é validado porque é a mesma fonte.
  */
-export function contentRoutes(service: ContentService = contentService): FastifyPluginAsyncZod {
+export function contentRoutes(service: ContentService): FastifyPluginAsyncZod {
   return async (app) => {
     app.post(
       '/api/content/generate',
@@ -30,10 +30,10 @@ export function contentRoutes(service: ContentService = contentService): Fastify
         schema: {
           summary: 'Solicita a geração de um conteúdo',
           description:
-            'Debita 1 crédito do usuário e cria o conteúdo em PENDING. O débito é um ' +
-            'UPDATE condicional atômico: sob concorrência, apenas uma requisição ' +
-            'consome o último crédito. Retorna imediatamente, sem aguardar o ' +
-            'processamento.',
+            'Debita 1 crédito do usuário, cria o conteúdo em PENDING e publica o job ' +
+            'de processamento. O débito é um UPDATE condicional atômico: sob ' +
+            'concorrência, apenas uma requisição consome o último crédito. Retorna ' +
+            'imediatamente, sem aguardar a IA — acompanhe por GET /api/content/{id}.',
           tags: ['contents'],
           body: generateContentBodySchema,
           response: {
@@ -42,6 +42,11 @@ export function contentRoutes(service: ContentService = contentService): Fastify
             402: errorResponseSchema.describe('Usuário existe, mas está sem créditos.'),
             404: errorResponseSchema.describe('userId não corresponde a nenhum usuário.'),
             500: errorResponseSchema.describe('Erro interno.'),
+            503: errorResponseSchema.describe(
+              'QUEUE_UNAVAILABLE — o conteúdo foi criado, mas o job não pôde ser ' +
+                'publicado. A compensação já rodou: o conteúdo fica FAILED e o crédito ' +
+                'é devolvido. A requisição pode ser repetida.',
+            ),
           },
         },
       },

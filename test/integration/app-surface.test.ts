@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { buildApp, type AppInstance } from '../../src/app.js';
+import type { AppInstance } from '../../src/app.js';
+import { buildTestApp } from '../helpers/app.js';
 
 /**
  * I-14 e superfície pública da aplicação montada de verdade.
@@ -17,7 +18,7 @@ let app: AppInstance;
 const SECRET = 'postgresql://ai_content:senha-secreta@postgres:5432/ai_content';
 
 beforeAll(async () => {
-  app = await buildApp();
+  app = await buildTestApp();
 
   // Rota só deste teste, registrada antes do `ready()`: o handler global precisa
   // de um erro inesperado de verdade para ser exercido ponta a ponta. `hide`
@@ -89,7 +90,16 @@ describe('OpenAPI em /docs', () => {
     // documento muda junto, porque é a mesma fonte (ADR-011).
     expect(Object.keys(bodySchema.properties).sort()).toEqual(['topic', 'userId']);
     // Os códigos de erro do catálogo estão documentados, não só o caminho feliz.
-    expect(Object.keys(generate.responses).sort()).toEqual(['201', '400', '402', '404', '500']);
+    // O `503` entrou na Fase 5: é o QUEUE_UNAVAILABLE, que o cliente precisa
+    // saber que existe para decidir se repete a requisição.
+    expect(Object.keys(generate.responses).sort()).toEqual([
+      '201',
+      '400',
+      '402',
+      '404',
+      '500',
+      '503',
+    ]);
   });
 
   it('serve a UI do Swagger em /docs', async () => {

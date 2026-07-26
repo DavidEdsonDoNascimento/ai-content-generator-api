@@ -1,6 +1,7 @@
 import type { Content } from '../../generated/prisma/client.js';
 import { ContentStatus } from '../../generated/prisma/enums.js';
 import type { DbClient } from '../../infra/db/prisma.js';
+import { ERROR_CODES } from '../../shared/errors/domain-errors.js';
 import { CANCELABLE_STATUSES } from './content.state.js';
 
 /**
@@ -56,4 +57,99 @@ export async function cancelIfCancelable(db: DbClient, id: string): Promise<Cont
   });
 
   return canceled[0] ?? null;
+}
+
+/**
+ * Compensação de `QUEUE_UNAVAILABLE`: marca o conteúdo como falho **e** libera o
+ * estorno, numa única instrução condicional (ADR-008).
+ *
+ * O predicado carrega as duas guardas que importam:
+ *
+ * - `status: PENDING` — o conteúdo acabou de ser criado e nada mais aconteceu
+ *   com ele. Se um Worker já o pegou (job publicado, resposta perdida no
+ *   caminho), a compensação não deve atropelar o processamento;
+ * - `creditRefundedAt: null` — **esta é a idempotência**. Uma segunda chamada
+ *   encontra o campo preenchido, não afeta linha alguma, e o `count = 0` impede
+ *   o segundo estorno.
+ *
+ * @returns `true` quando a linha foi compensada agora — e **somente** nesse caso
+ * o crédito deve ser devolvido.
+ */
+export async function failForQueueUnavailable(db: DbClient, id: string): Promise<boolean> {
+  const { count } = await db.content.updateMany({
+    where: { id, status: ContentStatus.PENDING, creditRefundedAt: null },
+    data: {
+      status: ContentStatus.FAILED,
+      // Código sanitizado, nunca a mensagem do Redis (ADR-010).
+      errorMessage: ERROR_CODES.QUEUE_UNAVAILABLE,
+      creditRefundedAt: new Date(),
+    },
+  });
+
+  return count === 1;
+}
+
+/**
+ * Claim do Worker: assume o conteúdo para processamento e conta a tentativa.
+ *
+ * Aceita `PENDING` (primeira execução) **e** `PROCESSING` (retry), porque entre
+ * as tentativas o conteúdo permanece em `PROCESSING` — voltar para `PENDING`
+ * seria uma transição que a máquina de estados proíbe (ADR-005). `CANCELED`,
+ * `COMPLETED` e `FAILED` estão fora do conjunto: o claim simplesmente não os
+ * encontra, e o `count = 0` diz ao Worker que outro ator já decidiu o destino.
+ *
+ * O incremento de `attempts` vive **dentro** do mesmo `UPDATE` de propósito: uma
+ * escrita separada poderia contar uma tentativa que nunca começou.
+ */
+export async function claimForProcessing(db: DbClient, id: string): Promise<boolean> {
+  const { count } = await db.content.updateMany({
+    where: { id, status: { in: [...CANCELABLE_STATUSES] } },
+    data: { status: ContentStatus.PROCESSING, attempts: { increment: 1 } },
+  });
+
+  return count === 1;
+}
+
+/**
+ * Finalização com sucesso. **Esta é a garantia** contra o Worker ressuscitar um
+ * conteúdo cancelado (ADR-006): o `WHERE status = PROCESSING` é avaliado
+ * atomicamente, então um `CANCELED` gravado durante os 5 s da IA faz este
+ * `UPDATE` não encontrar linha nenhuma.
+ *
+ * Na Fase 5 não há `fileUrl`/`fileKey` — o upload é da Fase 6. O conteúdo chega
+ * a `COMPLETED` sem arquivo, que é um checkpoint transitório, não o estado final
+ * pretendido pelo enunciado.
+ */
+export async function completeIfProcessing(db: DbClient, id: string): Promise<boolean> {
+  const { count } = await db.content.updateMany({
+    where: { id, status: ContentStatus.PROCESSING },
+    data: {
+      status: ContentStatus.COMPLETED,
+      completedAt: new Date(),
+      // Limpa o motivo de uma falha anterior que acabou sendo superada no retry.
+      errorMessage: null,
+    },
+  });
+
+  return count === 1;
+}
+
+/**
+ * Falha definitiva, gravada **apenas** quando as tentativas se esgotaram
+ * (ADR-005) e ainda assim de forma condicional: se o usuário cancelou no meio,
+ * o predicado não casa e o `CANCELED` sobrevive.
+ *
+ * `errorCode` é um código do catálogo, jamais `err.message` ou stack (ADR-010).
+ */
+export async function failIfProcessing(
+  db: DbClient,
+  id: string,
+  errorCode: string,
+): Promise<boolean> {
+  const { count } = await db.content.updateMany({
+    where: { id, status: ContentStatus.PROCESSING },
+    data: { status: ContentStatus.FAILED, errorMessage: errorCode },
+  });
+
+  return count === 1;
 }

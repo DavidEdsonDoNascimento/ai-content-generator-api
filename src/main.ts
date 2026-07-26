@@ -1,11 +1,35 @@
 import { buildApp, type AppInstance } from './app.js';
 import { env } from './config/env.js';
-import { disconnectPrisma } from './infra/db/prisma.js';
+import { logger } from './config/logger.js';
+import { disconnectPrisma, prisma } from './infra/db/prisma.js';
+import { closeConnection, createPublisherConnection } from './infra/queue/connection.js';
+import { createContentQueue, type ContentQueue } from './infra/queue/content-queue.js';
+import { buildContentService } from './modules/contents/content.service.js';
 
 /** Tempo máximo que o encerramento gracioso tem antes de o processo ser derrubado. */
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
-function registerShutdownHandlers(app: AppInstance): void {
+/**
+ * *Composition root* da API: é aqui — e só aqui — que as conexões nascem.
+ *
+ * Concentrar a montagem num ponto só é o que permite ao resto do código não
+ * saber se fala com um Redis de verdade ou com um duplo de teste, e é o que
+ * torna o encerramento previsível: quem abriu, fecha, na ordem inversa.
+ */
+function composeQueue(): { queue: ContentQueue; close: () => Promise<void> } {
+  const connection = createPublisherConnection(env.REDIS_URL);
+  const queue = createContentQueue({ connection, attempts: env.JOB_ATTEMPTS });
+
+  return {
+    queue,
+    close: async () => {
+      await queue.close();
+      await closeConnection(connection);
+    },
+  };
+}
+
+function registerShutdownHandlers(app: AppInstance, closeQueue: () => Promise<void>): void {
   let shuttingDown = false;
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
@@ -24,8 +48,10 @@ function registerShutdownHandlers(app: AppInstance): void {
 
     try {
       // Ordem importa: primeiro para de aceitar requisições e drena as que estão
-      // em voo, só então fecha o pool do banco que elas ainda podem estar usando.
+      // em voo, só então fecha a fila e o pool do banco que essas requisições
+      // ainda podiam estar usando.
       await app.close();
+      await closeQueue();
       await disconnectPrisma();
       app.log.info('API encerrada com sucesso');
       process.exit(0);
@@ -43,8 +69,17 @@ function registerShutdownHandlers(app: AppInstance): void {
 }
 
 async function start(): Promise<void> {
-  const app = await buildApp();
-  registerShutdownHandlers(app);
+  const { queue, close } = composeQueue();
+
+  const contentService = buildContentService({
+    db: prisma,
+    transaction: (fn) => prisma.$transaction(fn),
+    queue,
+    logger,
+  });
+
+  const app = await buildApp({ contentService });
+  registerShutdownHandlers(app, close);
 
   await app.listen({ host: env.HOST, port: env.PORT });
 }

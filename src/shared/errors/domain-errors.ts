@@ -15,6 +15,7 @@ export const ERROR_CODES = {
   CONTENT_ALREADY_COMPLETED: 'CONTENT_ALREADY_COMPLETED',
   CONTENT_ALREADY_CANCELED: 'CONTENT_ALREADY_CANCELED',
   CONTENT_ALREADY_FAILED: 'CONTENT_ALREADY_FAILED',
+  QUEUE_UNAVAILABLE: 'QUEUE_UNAVAILABLE',
 } as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
@@ -52,5 +53,23 @@ export class ContentNotFoundError extends AppError {
 export class ContentNotCancelableError extends AppError {
   constructor(code: ErrorCode, message: string) {
     super(code, message, 409);
+  }
+}
+
+/**
+ * O conteúdo foi criado e o crédito debitado, mas o job não pôde ser publicado.
+ *
+ * `503` e não `500` porque a causa é uma dependência indisponível, não um defeito
+ * do código: a requisição é legítima e vale a pena repetir. Quando este erro sai,
+ * a compensação já rodou — o conteúdo está `FAILED` e o crédito voltou (ADR-008).
+ * A mensagem é escrita para o cliente; o erro cru do Redis fica só no log.
+ */
+export class QueueUnavailableError extends AppError {
+  constructor() {
+    super(
+      ERROR_CODES.QUEUE_UNAVAILABLE,
+      'Content generation is temporarily unavailable. The credit was refunded; please try again.',
+      503,
+    );
   }
 }

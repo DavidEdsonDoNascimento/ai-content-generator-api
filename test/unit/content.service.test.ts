@@ -3,24 +3,29 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Content } from '../../src/generated/prisma/client.js';
 import { ContentStatus } from '../../src/generated/prisma/enums.js';
 import type { DbClient } from '../../src/infra/db/prisma.js';
+import type { JobRemovalOutcome } from '../../src/infra/queue/content-queue.js';
 import {
   createContentService,
   type ContentServiceDeps,
 } from '../../src/modules/contents/content.service.js';
 import { AppError } from '../../src/shared/errors/app-error.js';
 import { ERROR_CODES } from '../../src/shared/errors/domain-errors.js';
+import { createRecordingQueue, type RecordingQueue } from '../helpers/fake-queue.js';
 
 /**
- * U-08 — regra de negócio do service, com repositórios falsos.
+ * U-08 / U-09 — regra de negócio do service, com repositórios e fila falsos.
  *
  * O que estes testes protegem não é o SQL (isso é integração, contra o
  * PostgreSQL de verdade), e sim o **desenho** que torna o SQL suficiente:
  *
  * - o débito acontece dentro da transação, e a criação do conteúdo também;
+ * - a publicação do job acontece **depois do commit**, nunca dentro dele;
  * - a consulta que separa 404 de 402 **não** roda no caminho feliz — se ela
  *   virasse uma leitura prévia, o débito atômico deixaria de ser atômico;
- * - o cancelamento não lê antes de escrever;
- * - falha de qualquer passo estoura de dentro do escopo transacional.
+ * - a compensação de `QUEUE_UNAVAILABLE` devolve exatamente um crédito, mesmo
+ *   chamada duas vezes;
+ * - o cancelamento não lê antes de escrever, e a limpeza da fila não pode
+ *   desfazer um cancelamento que o banco já confirmou.
  */
 
 /** Dois clientes distintos: é assim que se prova em qual deles cada escrita caiu. */
@@ -49,53 +54,106 @@ function contentFixture(overrides: Partial<Content> = {}): Content {
   };
 }
 
-interface Harness {
-  service: ReturnType<typeof createContentService>;
-  deps: {
-    debitCredit: ReturnType<typeof vi.fn>;
-    exists: ReturnType<typeof vi.fn>;
-    create: ReturnType<typeof vi.fn>;
-    findById: ReturnType<typeof vi.fn>;
-    cancelIfCancelable: ReturnType<typeof vi.fn>;
-  };
-  /** `true` quando o callback da transação estourou — ou seja, houve rollback. */
-  rolledBack: () => boolean;
-}
-
-function buildService(overrides: {
+interface Overrides {
   debitCredit?: (db: DbClient, userId: string) => Promise<boolean>;
   exists?: (db: DbClient, userId: string) => Promise<boolean>;
+  refundCredit?: (db: DbClient, userId: string) => Promise<boolean>;
   create?: (db: DbClient, input: { userId: string; topic: string }) => Promise<Content>;
   findById?: (db: DbClient, id: string) => Promise<Content | null>;
   cancelIfCancelable?: (db: DbClient, id: string) => Promise<Content | null>;
-}): Harness {
-  let rolledBack = false;
+  failForQueueUnavailable?: (db: DbClient, id: string) => Promise<boolean>;
+  queue?: RecordingQueue;
+}
 
-  const debitCredit = vi.fn(overrides.debitCredit ?? (async () => true));
+function buildService(overrides: Overrides) {
+  let rolledBack = false;
+  /** Sequência de eventos observados — é o que prova a **ordem** das operações. */
+  const events: string[] = [];
+
+  const debitCredit = vi.fn(
+    overrides.debitCredit ??
+      (async () => {
+        events.push('debit');
+        return true;
+      }),
+  );
   const exists = vi.fn(overrides.exists ?? (async () => true));
-  const create = vi.fn(overrides.create ?? (async () => contentFixture()));
+  const refundCredit = vi.fn(
+    overrides.refundCredit ??
+      (async () => {
+        events.push('refund');
+        return true;
+      }),
+  );
+  const create = vi.fn(
+    overrides.create ??
+      (async () => {
+        events.push('create');
+        return contentFixture();
+      }),
+  );
   const findById = vi.fn(overrides.findById ?? (async () => null));
   const cancelIfCancelable = vi.fn(overrides.cancelIfCancelable ?? (async () => null));
+  const failForQueueUnavailable = vi.fn(
+    overrides.failForQueueUnavailable ??
+      (async () => {
+        events.push('compensate');
+        return true;
+      }),
+  );
+
+  const baseQueue = overrides.queue ?? createRecordingQueue();
+  const queue: RecordingQueue = {
+    enqueued: baseQueue.enqueued,
+    removed: baseQueue.removed,
+    enqueue: async (contentId) => {
+      events.push('enqueue');
+      await baseQueue.enqueue(contentId);
+    },
+    removeIfPending: async (contentId) => {
+      events.push('remove');
+      return baseQueue.removeIfPending(contentId);
+    },
+  };
+
+  const logger = { warn: vi.fn(), error: vi.fn() };
 
   const deps: ContentServiceDeps = {
     db: BASE_DB,
     // Fake fiel ao que o Prisma faz: entrega um client de transação distinto e
     // propaga a exceção — que é o que dispara o rollback de verdade.
     transaction: async (fn) => {
+      events.push('tx:begin');
       try {
-        return await fn(TX_DB);
+        const result = await fn(TX_DB);
+        events.push('tx:commit');
+        return result;
       } catch (error) {
         rolledBack = true;
+        events.push('tx:rollback');
         throw error;
       }
     },
-    users: { debitCredit, exists },
-    contents: { create, findById, cancelIfCancelable },
+    users: { debitCredit, exists, refundCredit },
+    contents: { create, findById, cancelIfCancelable, failForQueueUnavailable },
+    queue,
+    logger,
   };
 
   return {
     service: createContentService(deps),
-    deps: { debitCredit, exists, create, findById, cancelIfCancelable },
+    deps: {
+      debitCredit,
+      exists,
+      refundCredit,
+      create,
+      findById,
+      cancelIfCancelable,
+      failForQueueUnavailable,
+    },
+    queue,
+    logger,
+    events,
     rolledBack: () => rolledBack,
   };
 }
@@ -125,7 +183,18 @@ describe('generate', () => {
     });
   });
 
-  it('sem saldo e usuário existente → 402, sem criar conteúdo, com rollback', async () => {
+  it('publica o job **depois** do commit, nunca dentro da transação', async () => {
+    const harness = buildService({});
+
+    await harness.service.generate({ topic: 'Filas resilientes', userId: USER_ID });
+
+    // A ordem é a invariante (ADR-008). Publicar dentro da transação permitiria
+    // ao Worker consumir o job antes de a linha existir no banco.
+    expect(harness.events).toEqual(['tx:begin', 'debit', 'create', 'tx:commit', 'enqueue']);
+    expect(harness.queue.enqueued).toEqual([CONTENT_ID]);
+  });
+
+  it('sem saldo e usuário existente → 402, sem criar conteúdo, sem publicar job', async () => {
     const harness = buildService({
       debitCredit: async () => false,
       exists: async () => true,
@@ -139,10 +208,11 @@ describe('generate', () => {
     });
 
     expect(harness.deps.create).not.toHaveBeenCalled();
+    expect(harness.queue.enqueued).toEqual([]);
     expect(harness.rolledBack()).toBe(true);
   });
 
-  it('usuário inexistente → 404, distinguido do 402 só no caminho de erro', async () => {
+  it('usuário inexistente → 404, sem publicar job', async () => {
     const harness = buildService({
       debitCredit: async () => false,
       exists: async () => false,
@@ -157,6 +227,7 @@ describe('generate', () => {
 
     expect(harness.deps.exists).toHaveBeenCalledExactlyOnceWith(TX_DB, USER_ID);
     expect(harness.deps.create).not.toHaveBeenCalled();
+    expect(harness.queue.enqueued).toEqual([]);
   });
 
   it('falha ao criar o conteúdo desfaz o débito, em vez de cobrar por nada', async () => {
@@ -174,6 +245,92 @@ describe('generate', () => {
     // O débito e o insert estavam na mesma transação: o erro propagou de dentro
     // dela, então o PostgreSQL descarta as duas escritas.
     expect(harness.rolledBack()).toBe(true);
+    expect(harness.queue.enqueued).toEqual([]);
+  });
+});
+
+describe('U-09 — compensação de QUEUE_UNAVAILABLE', () => {
+  const redisDown = new Error('Connection is closed');
+
+  it('falha ao publicar → 503, conteúdo compensado e crédito devolvido uma vez', async () => {
+    const harness = buildService({ queue: createRecordingQueue({ enqueueError: redisDown }) });
+
+    const error = await harness.service
+      .generate({ topic: 'Redis fora do ar', userId: USER_ID })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AppError);
+    expect(error).toMatchObject({ statusCode: 503, code: ERROR_CODES.QUEUE_UNAVAILABLE });
+
+    expect(harness.deps.failForQueueUnavailable).toHaveBeenCalledExactlyOnceWith(TX_DB, CONTENT_ID);
+    expect(harness.deps.refundCredit).toHaveBeenCalledExactlyOnceWith(TX_DB, USER_ID);
+    // Conteúdo e estorno na mesma transação de compensação.
+    expect(harness.events).toEqual([
+      'tx:begin',
+      'debit',
+      'create',
+      'tx:commit',
+      'enqueue',
+      'tx:begin',
+      'compensate',
+      'refund',
+      'tx:commit',
+    ]);
+  });
+
+  it('não devolve crédito quando o UPDATE condicional não encontra linha', async () => {
+    // O conteúdo já saiu de PENDING (o job chegou a ser aceito, a resposta é que
+    // se perdeu) ou já foi compensado antes: em nenhum dos dois o crédito volta.
+    const harness = buildService({
+      queue: createRecordingQueue({ enqueueError: redisDown }),
+      failForQueueUnavailable: async () => false,
+    });
+
+    await expect(
+      harness.service.generate({ topic: 'Já compensado', userId: USER_ID }),
+    ).rejects.toMatchObject({ code: ERROR_CODES.QUEUE_UNAVAILABLE });
+
+    expect(harness.deps.failForQueueUnavailable).toHaveBeenCalledOnce();
+    expect(harness.deps.refundCredit).not.toHaveBeenCalled();
+  });
+
+  it('duas compensações do mesmo conteúdo devolvem crédito uma única vez', async () => {
+    // Reproduz a guarda `creditRefundedAt IS NULL`: a primeira chamada afeta a
+    // linha, a segunda não.
+    let alreadyCompensated = false;
+    const harness = buildService({
+      queue: createRecordingQueue({ enqueueError: redisDown }),
+      failForQueueUnavailable: async () => {
+        if (alreadyCompensated) {
+          return false;
+        }
+        alreadyCompensated = true;
+        return true;
+      },
+    });
+
+    const attempt = async (): Promise<unknown> =>
+      harness.service
+        .generate({ topic: 'Dupla compensação', userId: USER_ID })
+        .catch((error: unknown) => error);
+
+    await attempt();
+    await attempt();
+
+    expect(harness.deps.failForQueueUnavailable).toHaveBeenCalledTimes(2);
+    expect(harness.deps.refundCredit).toHaveBeenCalledOnce();
+  });
+
+  it('não vaza a mensagem do Redis para o cliente', async () => {
+    const harness = buildService({ queue: createRecordingQueue({ enqueueError: redisDown }) });
+
+    const error = await harness.service
+      .generate({ topic: 'Redis fora do ar', userId: USER_ID })
+      .catch((caught: unknown) => caught);
+
+    expect((error as AppError).message).not.toContain('Connection is closed');
+    // O detalhe existe — no log do servidor (ADR-010).
+    expect(harness.logger.error).toHaveBeenCalledOnce();
   });
 });
 
@@ -224,23 +381,58 @@ describe('getById', () => {
 });
 
 describe('cancel', () => {
-  it('cancela sem leitura prévia — o UPDATE condicional é a decisão', async () => {
-    const canceledAt = new Date('2026-07-26T10:00:02.000Z');
-    const harness = buildService({
-      cancelIfCancelable: async () =>
-        contentFixture({ status: ContentStatus.CANCELED, canceledAt }),
+  const canceledFixture = (): Content =>
+    contentFixture({
+      status: ContentStatus.CANCELED,
+      canceledAt: new Date('2026-07-26T10:00:02.000Z'),
     });
+
+  it('cancela sem leitura prévia e só então retira o job da fila', async () => {
+    const harness = buildService({ cancelIfCancelable: async () => canceledFixture() });
 
     const result = await harness.service.cancel(CONTENT_ID);
 
     expect(harness.deps.cancelIfCancelable).toHaveBeenCalledExactlyOnceWith(BASE_DB, CONTENT_ID);
     // Um `findById` aqui seria o `SELECT` + `if` que perde a corrida com o Worker.
     expect(harness.deps.findById).not.toHaveBeenCalled();
+    // A ordem importa: remover o job antes de o banco confirmar tiraria da fila
+    // um cancelamento que ainda podia ser recusado.
+    expect(harness.events).toEqual(['remove']);
+    expect(harness.queue.removed).toEqual([CONTENT_ID]);
     expect(result).toEqual({
       id: CONTENT_ID,
       status: ContentStatus.CANCELED,
       canceledAt: '2026-07-26T10:00:02.000Z',
     });
+  });
+
+  it.each<JobRemovalOutcome>(['not-removable', 'unavailable'])(
+    'continua respondendo sucesso quando a remoção da fila resulta em %s',
+    async (outcome) => {
+      const harness = buildService({
+        cancelIfCancelable: async () => canceledFixture(),
+        queue: createRecordingQueue({ removalOutcome: outcome }),
+      });
+
+      const result = await harness.service.cancel(CONTENT_ID);
+
+      // O cancelamento já está commitado no banco; a limpeza da fila é
+      // best-effort e não pode desfazê-lo. O Worker que pegar o job encontra
+      // CANCELED e termina em no-op.
+      expect(result.status).toBe(ContentStatus.CANCELED);
+      expect(harness.logger.warn).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('não tenta remover o job quando o banco recusa o cancelamento', async () => {
+    const harness = buildService({
+      cancelIfCancelable: async () => null,
+      findById: async () => contentFixture({ status: ContentStatus.COMPLETED }),
+    });
+
+    await expect(harness.service.cancel(CONTENT_ID)).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(harness.queue.removed).toEqual([]);
   });
 
   it('nenhuma linha afetada e id inexistente → 404', async () => {

@@ -1,8 +1,9 @@
+import type { ContentQueuePublisher } from '../../infra/queue/content-queue.js';
 import type { DbClient } from '../../infra/db/prisma.js';
-import { prisma } from '../../infra/db/prisma.js';
 import {
   ContentNotFoundError,
   InsufficientCreditsError,
+  QueueUnavailableError,
   UserNotFoundError,
 } from '../../shared/errors/domain-errors.js';
 import * as userRepository from '../users/user.repository.js';
@@ -29,6 +30,12 @@ import { cancelRejectionFor } from './content.state.js';
  * honesta (ADR-011).
  */
 
+/** Só o que o service precisa registrar: avisos de operação best-effort. */
+export interface ServiceLogger {
+  warn(context: Record<string, unknown>, message: string): void;
+  error(context: Record<string, unknown>, message: string): void;
+}
+
 /**
  * Dependências injetadas. Os tipos dos repositórios são **derivados dos módulos
  * reais**, não interfaces escritas à mão: não há abstração a manter em
@@ -41,8 +48,13 @@ import { cancelRejectionFor } from './content.state.js';
 export interface ContentServiceDeps {
   readonly db: DbClient;
   readonly transaction: <T>(fn: (tx: DbClient) => Promise<T>) => Promise<T>;
-  readonly users: Pick<typeof userRepository, 'debitCredit' | 'exists'>;
-  readonly contents: Pick<typeof contentRepository, 'create' | 'findById' | 'cancelIfCancelable'>;
+  readonly users: Pick<typeof userRepository, 'debitCredit' | 'exists' | 'refundCredit'>;
+  readonly contents: Pick<
+    typeof contentRepository,
+    'create' | 'findById' | 'cancelIfCancelable' | 'failForQueueUnavailable'
+  >;
+  readonly queue: ContentQueuePublisher;
+  readonly logger: ServiceLogger;
 }
 
 export interface ContentService {
@@ -52,20 +64,40 @@ export interface ContentService {
 }
 
 export function createContentService(deps: ContentServiceDeps): ContentService {
+  /**
+   * Desfaz a cobrança quando o job não pôde ser publicado (ADR-008).
+   *
+   * As duas escritas ficam na mesma transação, e o estorno só acontece se o
+   * `UPDATE` condicional do conteúdo tiver afetado uma linha — é esse `count`
+   * que torna a compensação idempotente: chamada duas vezes, ela devolve
+   * crédito uma vez só, porque `creditRefundedAt` já não é mais nulo.
+   */
+  async function compensate(contentId: string, userId: string): Promise<void> {
+    await deps.transaction(async (tx) => {
+      const compensated = await deps.contents.failForQueueUnavailable(tx, contentId);
+
+      if (compensated) {
+        await deps.users.refundCredit(tx, userId);
+      }
+    });
+  }
+
   return {
     /**
-     * Cobra 1 crédito e registra o conteúdo em `PENDING`.
+     * Cobra 1 crédito, registra o conteúdo em `PENDING` e publica o job.
      *
-     * As duas escritas ficam na **mesma transação** de propósito: debitar e
-     * depois falhar ao inserir cobraria o usuário por nada. O débito é um
-     * `UPDATE` condicional único, sem leitura prévia — ver `debitCredit`.
+     * A ordem é deliberada e não pode ser trocada:
      *
-     * A consulta que separa "usuário não existe" de "usuário sem saldo" só roda
-     * quando o débito falhou (ADR-002): no caminho feliz é uma ida ao banco a
-     * menos.
+     * 1. débito + criação na **mesma** transação (debitar e falhar ao inserir
+     *    cobraria o usuário por nada);
+     * 2. **commit**;
+     * 3. só então `queue.add`.
      *
-     * Nesta fase o conteúdo permanece em `PENDING` indefinidamente — o enqueue
-     * no BullMQ e o Worker chegam na Fase 5. Não é bug.
+     * Publicar dentro da transação inverteria o risco para o lado pior: o job
+     * poderia ser consumido antes do commit, e o Worker encontraria um
+     * `contentId` que ainda não existe no banco. Fora da transação, o pior caso
+     * é um conteúdo `PENDING` sem job — que é justamente o que a compensação
+     * abaixo resolve, de forma visível para o cliente.
      */
     async generate(input: GenerateContentBody): Promise<GenerateContentResponse> {
       const content = await deps.transaction(async (tx) => {
@@ -81,6 +113,19 @@ export function createContentService(deps: ContentServiceDeps): ContentService {
 
         return deps.contents.create(tx, { userId: input.userId, topic: input.topic });
       });
+
+      try {
+        await deps.queue.enqueue(content.id);
+      } catch (error) {
+        // O detalhe do Redis fica no log; o cliente recebe um código estável.
+        deps.logger.error(
+          { contentId: content.id, userId: content.userId, err: error },
+          'falha ao publicar o job de geração; compensando',
+        );
+
+        await compensate(content.id, content.userId);
+        throw new QueueUnavailableError();
+      }
 
       return toGenerateContentResponse(content);
     },
@@ -103,9 +148,12 @@ export function createContentService(deps: ContentServiceDeps): ContentService {
      * `SELECT` + `if` + `update` perderia a corrida com o Worker exatamente no
      * cenário que o enunciado cobra (cancelar durante os 5 s da IA).
      *
-     * A releitura só acontece **depois** de o banco ter recusado, e é estável:
-     * se a linha existe e não foi cancelada, ela está num estado terminal — e
-     * terminais são imutáveis, então o estado lido não muda mais (ADR-004).
+     * A limpeza da fila vem **depois** da confirmação no banco, e é
+     * best-effort: se o job já está `active`, se já saiu da fila ou se o Redis
+     * caiu, o cancelamento continua valendo — a guarda de estado no processor
+     * faz o Worker terminar em no-op. Inverter a ordem seria pior de um jeito
+     * silencioso: removeríamos um job de um cancelamento que o banco ainda pode
+     * recusar.
      */
     async cancel(id: string): Promise<CancelContentResponse> {
       const canceled = await deps.contents.cancelIfCancelable(deps.db, id);
@@ -116,6 +164,15 @@ export function createContentService(deps: ContentServiceDeps): ContentService {
         if (canceledAt === null) {
           // Inalcançável: o mesmo UPDATE que gravou CANCELED gravou canceledAt.
           throw new Error(`Conteúdo ${id} cancelado sem canceledAt.`);
+        }
+
+        const outcome = await deps.queue.removeIfPending(id);
+
+        if (outcome !== 'removed' && outcome !== 'absent') {
+          deps.logger.warn(
+            { contentId: id, outcome },
+            'cancelamento confirmado no banco, mas o job não pôde ser retirado da fila',
+          );
         }
 
         return toCancelContentResponse({ ...canceled, canceledAt });
@@ -132,10 +189,24 @@ export function createContentService(deps: ContentServiceDeps): ContentService {
   };
 }
 
-/** Instância usada pela aplicação. Os testes montam a sua com fakes. */
-export const contentService: ContentService = createContentService({
-  db: prisma,
-  transaction: (fn) => prisma.$transaction(fn),
-  users: userRepository,
-  contents: contentRepository,
-});
+/**
+ * Monta o service com os repositórios reais. Continua sendo uma função — e não
+ * um singleton de módulo — porque a fila abre conexão com o Redis: instanciá-la
+ * no import faria qualquer teste unitário que tocasse este arquivo depender de
+ * infraestrutura.
+ */
+export function buildContentService(deps: {
+  db: DbClient;
+  transaction: <T>(fn: (tx: DbClient) => Promise<T>) => Promise<T>;
+  queue: ContentQueuePublisher;
+  logger: ServiceLogger;
+}): ContentService {
+  return createContentService({
+    db: deps.db,
+    transaction: deps.transaction,
+    users: userRepository,
+    contents: contentRepository,
+    queue: deps.queue,
+    logger: deps.logger,
+  });
+}
