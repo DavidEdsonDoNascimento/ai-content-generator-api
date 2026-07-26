@@ -4,12 +4,17 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'node_modules/**', 'coverage/**'],
+    // `src/generated/**` é o Prisma Client gerado: não é código nosso, muda a
+    // cada `prisma generate` e não deve ser avaliado pelas nossas regras.
+    ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'src/generated/**'],
   },
   js.configs.recommended,
   tseslint.configs.recommendedTypeChecked,
   {
-    files: ['src/**/*.ts'],
+    // Todo TypeScript do repositório entra no lint com tipagem — os três globs
+    // correspondem ao `include` do tsconfig.json, então o `projectService`
+    // sempre encontra um projeto para o arquivo.
+    files: ['src/**/*.ts', 'prisma/**/*.ts', 'prisma.config.ts'],
     languageOptions: {
       parserOptions: {
         projectService: true,

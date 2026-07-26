@@ -20,6 +20,15 @@ const envSchema = z.object({
   HOST: z.string().min(1).default('0.0.0.0'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+
+  // Contém senha: a mensagem de erro abaixo é estática de propósito, para que
+  // um valor malformado nunca seja ecoado em log ou terminal.
+  DATABASE_URL: z
+    .string()
+    .min(1)
+    .refine((value) => value.startsWith('postgresql://') || value.startsWith('postgres://'), {
+      message: 'deve ser uma URL PostgreSQL (postgresql:// ou postgres://)',
+    }),
 });
 
 export type Env = z.infer<typeof envSchema>;

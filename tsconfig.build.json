@@ -1,0 +1,13 @@
+{
+  // Config de build: só `src/` vira `dist/`. O seed e o `prisma.config.ts` são
+  // executados via `tsx` pela CLI do Prisma e não fazem parte do artefato da API.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": true,
+    "declaration": false
+  },
+  "include": ["src/**/*.ts"]
+}

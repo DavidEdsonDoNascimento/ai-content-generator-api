@@ -3,6 +3,10 @@ dist
 coverage
 package-lock.json
 
+# Código gerado pelo Prisma — não é nosso para formatar
+src/generated
+prisma/migrations
+
 # Documentação é escrita e formatada à mão.
 *.md
 docs

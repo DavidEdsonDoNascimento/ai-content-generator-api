@@ -1,5 +1,6 @@
 import { buildApp, type AppInstance } from './app.js';
 import { env } from './config/env.js';
+import { disconnectPrisma } from './infra/db/prisma.js';
 
 /** Tempo máximo que o encerramento gracioso tem antes de o processo ser derrubado. */
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -22,7 +23,10 @@ function registerShutdownHandlers(app: AppInstance): void {
     forceExit.unref();
 
     try {
+      // Ordem importa: primeiro para de aceitar requisições e drena as que estão
+      // em voo, só então fecha o pool do banco que elas ainda podem estar usando.
       await app.close();
+      await disconnectPrisma();
       app.log.info('API encerrada com sucesso');
       process.exit(0);
     } catch (error) {

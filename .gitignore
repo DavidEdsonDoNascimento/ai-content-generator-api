@@ -5,6 +5,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# Prisma Client gerado — artefato de build, recriado por `npm run prisma:generate`
+src/generated/
+
 # Ambiente — nunca versionar segredos; só o exemplo entra no Git
 .env
 .env.*

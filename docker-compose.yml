@@ -1,14 +1,14 @@
-## Fase 2 — infraestrutura local. Sobe API, PostgreSQL, Redis e Minio (com o
-## bucket já criado) com um único `docker compose up`.
+## Infraestrutura local. Sobe PostgreSQL, Redis, Minio (com o bucket já criado),
+## aplica as migrations e sobe a API — tudo com um único `docker compose up`.
 ##
 ## O serviço `worker` ainda não existe: BullMQ e o Worker são implementados na
 ## Fase 5. Adicioná-lo agora só para preencher o compose faria `docker compose
-## up` falhar por falta de um `dist/worker.js` real — ver docs/0006_ChangeLog.md.
+## up` falhar por falta de um `dist/worker.js` real — ver ADR-019.
 ##
-## A API não depende de postgres/redis/minio nesta fase: o código ainda não os
-## consome (nem Prisma, nem BullMQ, nem o SDK do S3 existem em src/). Fazer a
-## API esperar por integrações que ela não usa simularia uma dependência que
-## não existe de verdade.
+## Ordem de inicialização: postgres saudável → `migrate` conclui com sucesso →
+## `api` sobe. A API só depende do que ela de fato usa: PostgreSQL (a partir da
+## Fase 3) e o schema já migrado. Redis e Minio ainda não são consumidos por
+## nenhuma linha de `src/`, então não entram no `depends_on` da API.
 
 services:
   postgres:
@@ -78,11 +78,36 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET:-ai-content}
     restart: 'no'
 
+  # One-shot: aplica as migrations pendentes (e, se RUN_SEED=true, o seed) antes
+  # de a API subir. Concentrar isso num serviço próprio mantém a CLI do Prisma
+  # fora da imagem da API e evita que réplicas da API disputem a mesma migration
+  # no futuro — ver ADR-022. Se falhar, a API não sobe.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      # Host interno da rede do compose — nunca `localhost`, que dentro do
+      # container apontaria para o próprio container.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai_content}:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env (copie de .env.example)}@postgres:5432/${POSTGRES_DB:-ai_content}
+      # Sem a variável, o seed NÃO roda: `.env.example` a define como `true`
+      # para o ambiente local (ADR-023).
+      RUN_SEED: ${RUN_SEED:-false}
+    restart: 'no'
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
       target: runner
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
     environment:
       # Fixas: são o contrato interno do container, não a configuração do host.
@@ -90,6 +115,7 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ai_content}:${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env (copie de .env.example)}@postgres:5432/${POSTGRES_DB:-ai_content}
     ports:
       - '${API_PORT:-3000}:3000'
     healthcheck:

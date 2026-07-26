@@ -1,4 +1,8 @@
 {
+  // Config de referência: cobre TUDO que é TypeScript no repositório (aplicação,
+  // seed e configuração da CLI do Prisma). É a que o editor e o ESLint com
+  // tipagem usam. A emissão de `dist/` fica em `tsconfig.build.json`, que
+  // restringe o escopo a `src/`.
   "compilerOptions": {
     /* Ambiente: Node.js 22 LTS, ESM nativo ("type": "module" no package.json). */
     "target": "ES2022",
@@ -7,11 +11,7 @@
     "moduleResolution": "NodeNext",
     "types": ["node"],
 
-    /* Saída */
-    "rootDir": "src",
-    "outDir": "dist",
-    "sourceMap": true,
-    "declaration": false,
+    "noEmit": true,
 
     /* Tipagem estrita (exigência do enunciado) */
     "strict": true,
@@ -29,5 +29,5 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "prisma/**/*.ts", "prisma.config.ts"]
 }

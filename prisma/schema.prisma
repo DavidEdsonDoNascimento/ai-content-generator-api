@@ -1,0 +1,67 @@
+// Modelo de dados da AI Content Generator API.
+// Corresponde ao que foi aprovado em docs/0003_Implementation_Plan.md (Fase 3).
+//
+// Prisma 7: o `datasource` não declara mais `url` — a connection string vive em
+// `prisma.config.ts` (para CLI/migrations) e chega ao client pelo driver adapter.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  runtime  = "nodejs"
+
+  // ESM com `module: NodeNext` (ADR-016): o client precisa gerar imports
+  // relativos com extensão explícita, senão o Node não resolve em runtime.
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ContentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  CANCELED
+  FAILED
+}
+
+model User {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String
+  credits   Int       @default(0)
+  contents  Content[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@map("users")
+}
+
+model Content {
+  id     String        @id @default(uuid()) @db.Uuid
+  userId String        @db.Uuid
+  user   User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  topic  String        @db.VarChar(200)
+  status ContentStatus @default(PENDING)
+
+  // URL pública; preenchida só em COMPLETED
+  fileUrl String?
+  // Chave interna no bucket: contents/{id}.txt
+  fileKey String?
+  // Código sanitizado (ADR-010), nunca stack trace
+  errorMessage String?
+  attempts     Int     @default(0)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+  canceledAt  DateTime?
+  // Guarda de estorno idempotente (ADR-008)
+  creditRefundedAt DateTime?
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+  @@map("contents")
+}
