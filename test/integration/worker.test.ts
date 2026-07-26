@@ -9,7 +9,7 @@ import type { ContentJobData } from '../../src/infra/queue/job.types.js';
 import { AI_GENERATION_FAILED, AiGenerationError } from '../../src/worker/ai/generate-content.js';
 import { buildTestApp, getContent, postCancel, postGenerate } from '../helpers/app.js';
 import { deferred, waitFor } from '../helpers/async.js';
-import { createContent, createUser } from '../helpers/factories.js';
+import { createContent, createUser, creditsOf } from '../helpers/factories.js';
 import { createFakeStorage, type FakeStorage } from '../helpers/fake-storage.js';
 import {
   buildProcessor,
@@ -350,11 +350,12 @@ describe('I-06 — cancelamento durante PROCESSING', () => {
 
 describe('I-10 — idempotência do processor', () => {
   it.each([ContentStatus.COMPLETED, ContentStatus.CANCELED, ContentStatus.FAILED])(
-    'reprocessar conteúdo em %s é no-op e não toca linha alguma',
+    'reprocessar conteúdo em %s é no-op: nem banco, nem storage, nem crédito',
     async (status) => {
       const user = await createUser(1);
       const content = await createContent({ userId: user.id, status });
       const before = await reload(content.id);
+      const creditsBefore = await creditsOf(user.id);
 
       const process = buildProcessor(async () => 'não deveria ser chamada', storage);
       await process(fakeJob(content.id));
@@ -365,6 +366,11 @@ describe('I-10 — idempotência do processor', () => {
       expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
       expect(after.completedAt?.getTime() ?? null).toBe(before.completedAt?.getTime() ?? null);
       expect(after.canceledAt?.getTime() ?? null).toBe(before.canceledAt?.getTime() ?? null);
+      // A guarda de terminal roda **antes** de qualquer chamada externa: nenhum
+      // upload, nenhum remove, nem sequer um `buildPublicUrl`.
+      expect(storage.history).toEqual([]);
+      // O Worker nunca mexe em crédito — nem para cobrar, nem para estornar.
+      expect(await creditsOf(user.id)).toBe(creditsBefore);
     },
   );
 

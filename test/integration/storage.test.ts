@@ -365,33 +365,14 @@ describe('finalização perdida para outra execução', () => {
   });
 });
 
+/**
+ * A tabela "estado terminal → no-op" vive em `worker.test.ts` (I-10), que numa
+ * passagem só assere banco, storage **e** crédito. Duplicá-la aqui custava três
+ * casos e não provava nada a mais. Fica o que aquela tabela não consegue montar
+ * a partir de uma fixture: um `COMPLETED` **de verdade**, produzido pelo Worker,
+ * com objeto no bucket.
+ */
 describe('idempotência com storage', () => {
-  it.each([ContentStatus.COMPLETED, ContentStatus.CANCELED, ContentStatus.FAILED])(
-    'reprocessar conteúdo em %s não chama o storage e não muda nada',
-    async (status) => {
-      const user = await createUser(1);
-      const content = await createContent({ userId: user.id, status });
-      const before = await reload(content.id);
-      const creditsBefore = (
-        await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { credits: true } })
-      ).credits;
-
-      await buildProcessor(async () => 'não deveria ser chamada', storage)(fakeJob(content.id));
-
-      const after = await reload(content.id);
-      expect(storage.history).toEqual([]);
-      expect(after.attempts).toBe(before.attempts);
-      expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
-      expect(after.completedAt?.getTime() ?? null).toBe(before.completedAt?.getTime() ?? null);
-      expect(after.canceledAt?.getTime() ?? null).toBe(before.canceledAt?.getTime() ?? null);
-      // O Worker nunca mexe em crédito — nem para cobrar, nem para estornar.
-      expect(
-        (await prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { credits: true } }))
-          .credits,
-      ).toBe(creditsBefore);
-    },
-  );
-
   it('reprocessar um COMPLETED não gera segundo objeto', async () => {
     const contentId = await generateContent();
 
