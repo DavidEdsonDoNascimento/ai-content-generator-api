@@ -5,10 +5,10 @@
 ## API e Worker usam a **mesma imagem**, com `command` diferente (ADR-012): mesma
 ## base de código e mesmas dependências, então duas imagens seriam duplicação.
 ##
-## Ordem de inicialização: postgres e redis saudáveis → `migrate` conclui com
-## sucesso → `api` e `worker` sobem. Cada serviço declara só o que de fato usa.
-## Minio ainda não é consumido por nenhuma linha de `src/` e por isso não entra em
-## nenhum `depends_on` — ele passa a ser dependência do Worker na Fase 6.
+## Ordem de inicialização: postgres e redis saudáveis → `migrate` e `minio-init`
+## concluem com sucesso → `api` e `worker` sobem. Cada serviço declara só o que
+## de fato usa (ADR-030): o Worker é o único que fala com o Minio, então é o
+## único com `depends_on: minio-init` e com credenciais de S3 no ambiente.
 ##
 ## Migrations continuam sendo responsabilidade exclusiva do serviço one-shot
 ## `migrate` (ADR-022). O Worker **não** as aplica: dois processos correndo
@@ -159,6 +159,14 @@ services:
       # não tem o que fazer.
       redis:
         condition: service_healthy
+      # O bucket precisa existir **antes** do primeiro upload. Esperar o `minio`
+      # ficar saudável não bastaria: entre o serviço responder e o `mc mb` rodar
+      # há uma janela em que um job rápido receberia `NoSuchBucket` e queimaria
+      # as três tentativas por um motivo puramente de boot. Depender da conclusão
+      # do one-shot fecha essa janela — e, como `minio-init` já espera o `minio`
+      # saudável, a saúde do storage vem junto por transitividade.
+      minio-init:
+        condition: service_completed_successfully
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -169,7 +177,24 @@ services:
       # permite demonstrar o retry de forma determinística.
       AI_DELAY_MS: ${AI_DELAY_MS:-5000}
       AI_FAILURE_RATE: ${AI_FAILURE_RATE:-0.2}
-      JOB_ATTEMPTS: ${JOB_ATTEMPTS:-3}
+      # `JOB_ATTEMPTS` NÃO entra aqui: quem define o número de tentativas é quem
+      # publica o job (a API, via `opts.attempts`). O Worker apenas obedece ao
+      # que veio no job — declarar a variável dos dois lados criaria duas fontes
+      # de verdade que podem divergir sem ninguém perceber.
+      #
+      # Os dois endereços do MESMO Minio, e eles **não** são intercambiáveis
+      # (ADR-009): o Worker fala com o storage pelo host interno da rede do
+      # Compose, e persiste em `fileUrl` o endereço que abre no navegador do
+      # host. Trocar um pelo outro faz tudo funcionar aqui dentro e entrega ao
+      # cliente um link que não resolve em lugar nenhum.
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:-http://localhost:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${MINIO_BUCKET:-ai-content}
+      # Mesmas credenciais do Minio local. Em produção seriam as da conta S3 —
+      # por isso variáveis próprias, e não uma referência direta a MINIO_*.
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?defina MINIO_ROOT_USER no .env (copie de .env.example)}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?defina MINIO_ROOT_PASSWORD no .env (copie de .env.example)}
 
 volumes:
   pgdata:
